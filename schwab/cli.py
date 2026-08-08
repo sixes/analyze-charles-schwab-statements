@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 from . import store
-from .domain import fmt_money
+from .domain import DEFAULT_RISK_FREE, fmt_money
 
 
 def build_holdings_frame(records: list):
@@ -65,9 +65,21 @@ def parse_pdfs(directory: Path, verbose: bool):
     return records, paths
 
 
+def resolve_rf(args) -> float:
+    """--rf wins; otherwise the rate saved from the UI, else the shared default."""
+    if args.rf is not None:
+        return args.rf
+    try:
+        with store.connect() as conn:
+            return store.risk_free(conn)
+    except Exception:
+        return DEFAULT_RISK_FREE
+
+
 def cmd_analyze(args) -> int:
     from . import analytics, charts as chart_module, report as report_module
 
+    rf = resolve_rf(args)
     records, paths = [], []
     if args.from_db:
         with store.connect() as conn:
@@ -99,7 +111,7 @@ def cmd_analyze(args) -> int:
                 print(f"  stored {record['file']} ({digest[:12]})")
 
     frame = analytics.build_frame(records)
-    metrics = analytics.compute_metrics(frame, args.rf)
+    metrics = analytics.compute_metrics(frame, rf)
     attribution = analytics.class_attribution(frame)
     holdings = build_holdings_frame(records)
     flows = build_flows_frame(records)
@@ -165,7 +177,7 @@ def cmd_analyze(args) -> int:
         dump("current_positions.csv", positions)
 
     report = report_module.build_report(
-        frame, metrics, attribution, args.rf, transactions,
+        frame, metrics, attribution, rf, transactions,
         reconciliation=reconciliation, positions=positions, interim=interim,
     )
     dump("performance_report.txt", report + "\n")
@@ -295,7 +307,8 @@ def main(argv=None) -> int:
     analyze = sub.add_parser("analyze", help="parse statements and write data, report and charts")
     analyze.add_argument("--dir", default=".", help="directory containing statement PDFs")
     analyze.add_argument("--out", default="output", help="output directory")
-    analyze.add_argument("--rf", type=float, default=0.042, help="annual risk-free rate")
+    analyze.add_argument("--rf", type=float, default=None,
+                         help="annual risk-free rate; defaults to the rate saved in the UI")
     analyze.add_argument("--from-db", action="store_true",
                          help="analyze the statements already stored instead of reading PDFs")
     analyze.add_argument("--save-db", action="store_true",

@@ -117,7 +117,11 @@ inventory() {
 ingest() {
     load_env
     mkdir -p "$(dirname "$LOCK_FILE")"
-    exec flock -n "$LOCK_FILE" python3 -m schwab ingest "$@"
+    # Cron appends to .run/ingest.log, so each line carries its own timestamp -
+    # a bare summary line is otherwise indistinguishable from the tick before it.
+    # pipefail is set, so ingest's exit code still reaches cron.
+    flock -n "$LOCK_FILE" python3 -u -m schwab ingest "$@" 2>&1 \
+        | awk '{ print strftime("%Y-%m-%d %H:%M:%S"), $0; fflush() }'
 }
 
 cron_install() {

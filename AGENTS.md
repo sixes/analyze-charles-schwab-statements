@@ -46,7 +46,7 @@ pip3 install -r requirements.txt
 # CLI
 python3 -m schwab analyze                    # parse ./*.PDF -> ./output
 python3 -m schwab analyze --from-db          # analyze what is already stored
-python3 -m schwab analyze --dir path --out path --rf 0.042
+python3 -m schwab analyze --dir path --out path --rf 0.03
 python3 -m schwab analyze --verbose          # show unparsed statement lines
 python3 -m schwab analyze --save-db          # also persist each statement
 python3 -m schwab ingest [--days 7] [--dry-run] [--reprocess] [--no-notify]
@@ -122,6 +122,12 @@ cascade` and a statement's child rows are deleted and reinserted on every re-par
 trade stored under that lifecycle would vanish when its PDF was re-uploaded. Email bodies
 are never stored — they carry the account tail and the address — and IMAP stays the
 archive.
+
+A `settings` key/value table holds the assumptions the UI can change, currently only
+`risk_free`. It defaults to `domain.DEFAULT_RISK_FREE` (3%), the app writes it back when
+the sidebar value changes, and `analyze` reads it when `--rf` is absent so the CLI and the
+web UI never disagree on the rate. It feeds Sharpe and Sortino only, so a missing or
+malformed value falls back to the default rather than failing.
 
 `load_records()` must return dicts indistinguishable from freshly parsed ones, because
 the analytics assume it:
@@ -273,7 +279,10 @@ anyway, leaving the position visible and unpriced rather than vanishing.
 ## Ingestion and notifications
 
 `./run.sh ingest` is meant for cron every five minutes and runs under `flock` so a slow
-IMAP round trip cannot overlap the next tick. `mailbox.py` selects the folder **readonly**
+IMAP round trip cannot overlap the next tick. It pipes the run's output through a
+timestamp prefix, because cron appends every tick to one `.run/ingest.log` and an
+untimestamped summary line cannot be told from the tick before it; `pipefail` keeps
+ingest's own exit code reaching cron. `mailbox.py` selects the folder **readonly**
 and never deletes, moves or flags mail; the mailbox holds thousands of unrelated personal
 messages, so the search stays narrow (a `SINCE` floor plus a subject match). The subject is
 the anchor rather than the From address, because both the direct Schwab mail and the

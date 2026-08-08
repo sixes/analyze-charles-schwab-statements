@@ -314,6 +314,15 @@ def ensure_schema(conn: psycopg.Connection) -> None:
             """
         )
         cur.execute(
+            f"""
+            create table if not exists {SCHEMA}.settings (
+                key text primary key,
+                value text not null,
+                updated_at timestamptz not null default now()
+            )
+            """
+        )
+        cur.execute(
             f"create index if not exists holdings_statement_idx "
             f"on {SCHEMA}.holdings (statement_id)"
         )
@@ -828,3 +837,41 @@ def load_quotes(conn: psycopg.Connection) -> dict:
             }
             for row in cur.fetchall()
         }
+
+
+# --------------------------------------------------------------------------
+# settings
+# --------------------------------------------------------------------------
+def get_setting(conn: psycopg.Connection, key: str) -> str | None:
+    with conn.cursor() as cur:
+        cur.execute(f"select value from {SCHEMA}.settings where key = %s", [key])
+        row = cur.fetchone()
+    return row[0] if row else None
+
+
+def set_setting(conn: psycopg.Connection, key: str, value: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            insert into {SCHEMA}.settings (key, value, updated_at)
+            values (%s, %s, now())
+            on conflict (key) do update set value = excluded.value, updated_at = now()
+            """,
+            [key, str(value)],
+        )
+    conn.commit()
+
+
+def risk_free(conn: psycopg.Connection) -> float:
+    """The stored annual risk-free rate, or the default when none is saved."""
+    raw = get_setting(conn, "risk_free")
+    if raw is None:
+        return A.DEFAULT_RISK_FREE
+    try:
+        return float(raw)
+    except ValueError:
+        return A.DEFAULT_RISK_FREE
+
+
+def save_risk_free(conn: psycopg.Connection, rate: float) -> None:
+    set_setting(conn, "risk_free", f"{float(rate):.6f}")

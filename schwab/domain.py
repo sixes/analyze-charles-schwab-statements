@@ -9,6 +9,10 @@ from __future__ import annotations
 from datetime import date, timedelta
 from decimal import Decimal
 
+# Feeds Sharpe and Sortino only. Overridable in the UI and with --rf, and the
+# chosen value is stored so it survives a restart.
+DEFAULT_RISK_FREE = 0.03
+
 CLASS_COLUMNS = [
     "Cash",
     "Money Market",

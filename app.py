@@ -31,7 +31,7 @@ from schwab.analytics import (
     transaction_frame,
 )
 from schwab.charts import build_charts
-from schwab.domain import fmt_ratio
+from schwab.domain import DEFAULT_RISK_FREE, fmt_ratio
 from schwab.report import build_report
 from schwab.statements import StatementParser
 
@@ -106,6 +106,23 @@ def write_stored(pairs: list) -> str | None:
         return str(error)
 
 
+def read_risk_free() -> float:
+    try:
+        with store.connect() as conn:
+            return store.risk_free(conn)
+    except Exception:
+        return DEFAULT_RISK_FREE
+
+
+def write_risk_free(rate: float) -> str | None:
+    try:
+        with store.connect() as conn:
+            store.save_risk_free(conn, rate)
+        return None
+    except Exception as error:
+        return str(error)
+
+
 st.title("Charles Schwab Statement Analyzer")
 st.caption(
     "Monthly performance measurement and attribution from your statement PDFs. "
@@ -154,15 +171,20 @@ with st.sidebar:
         )
 
     st.header("Assumptions")
+    stored_rf = read_risk_free()
     risk_free = st.number_input(
         "Risk-free rate (annual)",
         min_value=0.0,
         max_value=0.25,
-        value=0.042,
+        value=stored_rf,
         step=0.001,
         format="%.3f",
-        help="Used only for the Sharpe and Sortino ratios.",
+        help="Used only for the Sharpe and Sortino ratios. Saved for next time.",
     )
+    if abs(risk_free - stored_rf) > 1e-9:
+        write_error = write_risk_free(risk_free)
+        if write_error:
+            st.caption(f"Could not save the rate: {write_error}")
 
 if not uploads and not (use_history and stored_records):
     st.info("Upload one or more Schwab statement PDFs in the sidebar to begin.")
