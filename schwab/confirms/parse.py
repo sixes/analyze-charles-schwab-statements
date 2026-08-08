@@ -21,6 +21,30 @@ The shape of one trade block, as Schwab prints it in the text/plain part:
     Total: $0.68 $799.32
     Additional information for this security:
     - We will hold this new option position short in your account (sold to open).
+
+A confirmation too long for one email is split, and the continuation part prints the
+same fields one table cell per line, dates the header `20260807` rather than
+`08/07/2026`, carries no account line, and repeats the `Symbol:` header to print each
+trade's Additional-information notes as a block of its own, after the table blocks:
+
+      Symbol:
+    SOXL 08/21/2026 70.00 P
+    Security Description:
+    DRXN SEMICN BULL 3X 08/21/2026 $70 Put
+    Action:
+    Purchase
+    ...
+    Quantity Price Principal Charge and/or Interest Total Amount
+    1.00000
+    $0.600000000
+    $60.00
+      Symbol:
+    SOXL 08/21/2026 70.00 P
+    Additional information for this security:
+    - Bought to close your short option position.
+
+Label patterns therefore have to tolerate a newline between a label and its value, and
+the intent has to be merged back into the trade it describes.
 """
 
 from __future__ import annotations
@@ -33,7 +57,9 @@ from ..domain import DEBIT_ACTIONS, OPTION_MULTIPLIER, occ_symbol
 SUBJECT_HINT = "Schwab eConfirms"
 
 ACCOUNT_RE = re.compile(r"Account ending:\s*(\d{3,4})")
-CONFIRM_DATE_RE = re.compile(r"trade confirmation\(s\)\s+for\s+(\d{2}/\d{2}/\d{4})")
+CONFIRM_DATE_RE = re.compile(
+    r"trade confirmation\(s\)\s+for\s+(\d{2}/\d{2}/\d{4}|\d{8})"
+)
 BLOCK_SPLIT_RE = re.compile(r"^\s*Symbol:\s*$", re.MULTILINE)
 
 FIELD_RE = {
@@ -49,10 +75,13 @@ FIELD_RE = {
 # "Total: $0.68 $799.32" - charges then the net amount credited or debited.
 TOTAL_RE = re.compile(r"^Total:\s*\$?([\d,]+\.\d{2})\s+\$?([\d,]+\.\d{2})", re.MULTILINE)
 
-# "1 $8.00 $800.00" - quantity, per-share price, principal. Quantity may be
-# fractional for equities; price and principal always carry cents.
+# "1 $8.00 $800.00" - quantity, per-share price, principal, following the column
+# header. Anchoring on the header is what makes the pattern safe to let whitespace span
+# newlines, which a continuation email needs since it prints one cell per line;
+# unanchored, the Commission and Total rows below are the same shape. Quantity may be
+# fractional for equities and a continuation pads the price to nine decimal places.
 AMOUNTS_RE = re.compile(
-    r"^([\d,]+(?:\.\d+)?)\s+\$([\d,]+\.\d{2,4})\s+\$([\d,]+\.\d{2})\s*$", re.MULTILINE
+    r"Total\s*Amount\s+([\d,]+(?:\.\d+)?)\s+\$([\d,]+\.\d+)\s+\$([\d,]+\.\d{2})"
 )
 
 # "SOXL 08/28/2026 104.00 P" on the line under the Symbol: marker.
@@ -87,6 +116,12 @@ def to_amount(token: str):
 def to_date(token: str, reference: date = None):
     if not token:
         return None
+    if len(token) == 8 and token.isdigit():
+        # A continuation email's header dates itself 20260807.
+        try:
+            return date(int(token[:4]), int(token[4:6]), int(token[6:]))
+        except ValueError:
+            return None
     parts = token.split("/")
     if len(parts) != 3:
         return None
@@ -214,6 +249,40 @@ def parse_block(block: str, seq: int, header: dict) -> tuple[dict | None, str | 
     return trade, None
 
 
+def merge_note(trades: list[dict], block: str) -> bool:
+    """Attach a notes-only block to the trade it describes. True when consumed.
+
+    A continuation email prints the trade tables first and then repeats `Symbol:` once
+    per trade to carry the Additional-information notes, so the intent arrives in a
+    block of its own with no Action line and no amounts row. Matching is required rather
+    than assumed: a genuinely mis-parsed trade block has the same shape, and returning
+    False leaves it to be reported as a failure instead of silently dropped.
+    """
+    if FIELD_RE["action"].search(block) or AMOUNTS_RE.search(block):
+        return False
+    intent = read_intent(block)
+    identity = parse_symbol_line(block)
+    if intent is None or not identity:
+        return False
+
+    cusip = field(FIELD_RE["cusip"], block)
+    for trade in trades:  # print order, so repeated contracts pair up in order
+        if trade["symbol"] != identity["symbol"]:
+            continue
+        if trade["strike"] != identity.get("strike"):
+            continue
+        if trade["option_type"] != identity.get("option_type"):
+            continue
+        if cusip and trade["cusip"] and cusip != trade["cusip"]:
+            continue
+        if trade["intent"] is None:
+            trade["intent"] = intent
+            return True
+        if trade["intent"] == intent:
+            return True
+    return False
+
+
 def check_arithmetic(trade: dict) -> str | None:
     """Reject a block whose printed numbers do not agree.
 
@@ -269,6 +338,8 @@ def parse_confirm(text: str) -> dict:
         trade, error = parse_block(block, seq, header)
         if trade:
             trades.append(trade)
+        elif merge_note(trades, block):
+            continue
         elif error:
             failed.append({"seq": seq, "error": error})
 

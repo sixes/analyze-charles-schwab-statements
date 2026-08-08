@@ -185,6 +185,20 @@ Financial analysis in this repo follows the `cfa-analyst` agent's standards. The
   Additional-information note ("sold to open" -> `open`, "Bought to close your short
   option position" -> `close`) and record `null` when the note is absent. The cash sign
   comes from `Action:` and is independent of intent.
+- A confirmation too long for one email is **split**, and the continuation part is a
+  different layout, not a corrupt one: it prints one table cell per line, dates its header
+  `20260807` instead of `08/07/2026`, prints no account line (so `account_tail` is
+  legitimately null), pads the price to nine decimals, and repeats the `Symbol:` header to
+  print each trade's Additional-information notes as its own block after all the table
+  blocks. Label patterns work across both because `\s*` spans newlines. The amounts row
+  cannot: it is anchored to the `Total Amount` column header, because letting whitespace
+  span newlines without that anchor lets the Commission and Total rows below match the
+  same shape. The notes blocks carry the intent for a trade parsed earlier, so
+  `merge_note` attaches them by symbol, strike, type and CUSIP; a note matching no trade
+  is still reported, since a genuinely mis-parsed trade block looks identical.
+- `parse_confirm` returns `failed` as `{"seq", "error"}` dicts, not strings. Format them
+  before joining or putting them in `outcome["failures"]` — the notification renders that
+  list as text and a dict there aborts the whole ingestion pass as a "database error".
 - The quantity delta follows from `Action:` alone: a sale is `-qty` whether it opens a
   short or closes a long. Intent affects how cost basis is attributed, not direction, so
   a missing intent flags the position rather than discarding a known delta.
@@ -292,10 +306,18 @@ A notification fires for every confirmation *processed* — success, partial or 
 stays **silent when a tick finds nothing new**. That exception is deliberate: 288 ticks a
 day of "nothing happened" would train the notification to be muted, defeating its purpose.
 Subjects are short enough to read whole on a lock screen (`Schwab: 5 trades, +$1,093.67
-credit`, `Schwab: INGEST FAILED - imap login`); detail goes in the body. The body is prose,
-not a field dump: `notify.describe()` turns each trade into a sentence ("Sold to open 1 SOXL
-$104 put expiring Aug 28 at $8.00 - credit $799.32"), and a failure says what broke and what
-to check. It is read on a phone by a person, so keep it that way. A notification failure is
+credit`, `Schwab: INGEST FAILED - imap login`); detail goes in the body. The mail is
+multipart/alternative and both parts have to tell the whole story, because which one a
+reader sees is not ours to choose. `html_for()` is the preferred part and puts the trades
+in a table (action, contract, expiry, quantity, price, cash); `body_for()` is the text
+fallback that drives the preview pane, and it stays prose, not a field dump:
+`notify.describe()` turns each trade into a sentence ("Sold to open 1 SOXL $104 put
+expiring Aug 28 at $8.00 - credit $799.32"). The two renderings share `_verb()` and
+`_contract()` so they cannot drift into describing the same trade differently, a trade
+whose intent is unknown is marked in both rather than shown as a bare "Sold", and a
+failure says what broke and what to check. Styles are inline because mail clients strip
+stylesheets, and every interpolated value is escaped — it all comes from email text. It is
+read on a phone by a person, so keep it that way. A notification failure is
 logged and never masks the ingestion result, and ingest exits non-zero on failure so cron's
 own mail is a backstop if SMTP is what broke.
 

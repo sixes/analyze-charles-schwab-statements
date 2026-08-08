@@ -91,7 +91,8 @@ def run(days: int = 7, reprocess: bool = False, dry_run: bool = False,
                     continue
 
                 trades = parsed["trades"]
-                failures = parsed["failed"]
+                failures = [f"block {item['seq']}: {item['error']}"
+                            for item in parsed["failed"]]
                 outcome["blocks_failed"] += len(failures)
                 outcome["failures"].extend(failures)
 
