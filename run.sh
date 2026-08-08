@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Control the Schwab Statement Analyzer web app on 0.0.0.0:9388.
 #
-#   ./run.sh start | stop | restart | status | logs | initdb
+#   ./run.sh start | stop | restart | status | logs | initdb | inventory
+#   ./run.sh ingest [--days N] [--dry-run]   pull new trade confirmations
+#   ./run.sh cron-install                    print the crontab line to add
 #
 # The password is read from $APP_PASSWORD, else from .env, else from
 # .app_password (created on first start). Statements contain account numbers and
@@ -13,6 +15,7 @@ cd "$(dirname "$0")"
 PORT=9388
 PID_FILE=.run/app.pid
 LOG_FILE=.run/app.log
+LOCK_FILE=.run/ingest.lock
 PASS_FILE=.app_password
 ENV_FILE=.env
 
@@ -101,12 +104,30 @@ status() {
 
 initdb() {
     load_env
-    python3 store.py initdb
+    python3 -m schwab initdb
 }
 
 inventory() {
     load_env
-    python3 store.py inventory
+    python3 -m schwab inventory
+}
+
+# Cron fires this every few minutes. flock keeps a slow IMAP round trip from
+# overlapping the next tick, which would try to store the same confirm twice.
+ingest() {
+    load_env
+    mkdir -p "$(dirname "$LOCK_FILE")"
+    exec flock -n "$LOCK_FILE" python3 -m schwab ingest "$@"
+}
+
+cron_install() {
+    echo "Add this line with 'crontab -e' (not installed automatically):"
+    echo
+    echo "*/5 * * * * cd $PWD && ./run.sh ingest >> .run/ingest.log 2>&1"
+    echo
+    echo "It runs under flock, so overlapping ticks exit immediately."
+    echo "A notification is sent for every confirmation processed, and stays silent"
+    echo "on a tick that finds nothing new."
 }
 
 case "${1:-start}" in
@@ -117,8 +138,10 @@ case "${1:-start}" in
     logs) tail -n 100 -f "$LOG_FILE" ;;
     initdb) initdb ;;
     inventory) inventory ;;
+    ingest) shift; ingest "$@" ;;
+    cron-install) cron_install ;;
     *)
-        echo "Usage: $0 {start|stop|restart|status|logs|initdb|inventory}" >&2
+        echo "Usage: $0 {start|stop|restart|status|logs|initdb|inventory|ingest|cron-install}" >&2
         exit 2
         ;;
 esac

@@ -17,8 +17,23 @@ import os
 import pandas as pd
 import streamlit as st
 
-import analyze_schwab as A
-import store
+from schwab import positions as positions_module
+from schwab import reconcile as reconcile_module
+from schwab import store
+from schwab.analytics import (
+    build_frame,
+    class_attribution,
+    combined_transaction_frame,
+    compute_metrics,
+    premium_by_month,
+    premium_by_symbol,
+    premium_summary,
+    transaction_frame,
+)
+from schwab.charts import build_charts
+from schwab.domain import fmt_ratio
+from schwab.report import build_report
+from schwab.statements import StatementParser
 
 st.set_page_config(page_title="Schwab Statement Analyzer", page_icon="chart_with_upwards_trend", layout="wide")
 
@@ -47,7 +62,7 @@ require_password()
 
 @st.cache_data(show_spinner=False)
 def parse_upload(data: bytes, name: str) -> dict:
-    return A.StatementParser(io.BytesIO(data), name=name).parse()
+    return StatementParser(io.BytesIO(data), name=name).parse()
 
 
 def money(value) -> str:
@@ -69,6 +84,16 @@ def read_stored() -> tuple[list, list, str | None]:
             return store.load_records(conn), store.statement_index(conn), None
     except Exception as error:
         return [], [], str(error)
+
+
+def read_confirms():
+    """Confirm trades and cached market marks. Both are optional: the app still works
+    when no confirmation has been ingested and when no quote could be fetched."""
+    try:
+        with store.connect() as conn:
+            return store.load_trades(conn), store.load_quotes(conn), None
+    except Exception as error:
+        return pd.DataFrame(), {}, str(error)
 
 
 def write_stored(pairs: list) -> str | None:
@@ -207,9 +232,9 @@ for record in records:
         )
     seen[key] = record["file"]
 
-frame = A.build_frame(records)
-metrics = A.compute_metrics(frame, risk_free)
-attribution = A.class_attribution(frame)
+frame = build_frame(records)
+metrics = compute_metrics(frame, risk_free)
+attribution = class_attribution(frame)
 
 holdings = pd.DataFrame(
     [
@@ -230,7 +255,7 @@ flows = pd.DataFrame(
         for flow in record["_flows"]
     ]
 )
-settled_transactions = A.transaction_frame(records)
+settled_transactions = transaction_frame(records)
 
 months = metrics["months"]
 st.success(
@@ -261,9 +286,21 @@ if not metrics["annualization_valid"]:
         "volatility, Sharpe, Sortino and drawdown need a longer record. Upload more months."
     )
 
-charts = dict(A.build_charts(frame, holdings, metrics))
+charts = dict(build_charts(frame, holdings, metrics))
 
-tab_overview, tab_performance, tab_risk, tab_income, tab_premium, tab_positions, tab_data = st.tabs(
+confirm_trades, quote_marks, confirm_error = read_confirms()
+
+(
+    tab_overview,
+    tab_performance,
+    tab_risk,
+    tab_income,
+    tab_premium,
+    tab_positions,
+    tab_live,
+    tab_reconcile,
+    tab_data,
+) = st.tabs(
     [
         "Overview",
         "Performance",
@@ -271,26 +308,59 @@ tab_overview, tab_performance, tab_risk, tab_income, tab_premium, tab_positions,
         "Income & gains",
         "Premiums & transactions",
         "Positions",
+        "Positions (live)",
+        "Reconciliation",
         "Report & data",
     ]
 )
 
 with tab_overview:
     st.subheader("Account value")
-    st.pyplot(charts["01_account_value.png"], width="stretch")
+    st.plotly_chart(charts["01_account_value"], use_container_width=True)
     st.subheader("How the value changed")
-    st.pyplot(charts["07_value_reconciliation.png"], width="stretch")
+    st.plotly_chart(charts["07_value_reconciliation"], use_container_width=True)
     st.caption(
         "Deposits raise account value without being performance. The time-weighted "
         "return strips them out; the money-weighted return keeps their timing."
     )
 
 with tab_performance:
+    st.subheader("Since the last statement (confirmation feed)")
+    interim = positions_module.interim_performance(records, confirm_trades, marks=quote_marks)
+    if interim["anchor_date"] is None:
+        st.info("No statement is stored, so there is nothing to roll forward from.")
+    elif interim["trade_count"] == 0:
+        st.info(
+            f"No confirmed trades since {interim['anchor_date']}. The monthly figures below "
+            "are current."
+        )
+    else:
+        cells = st.columns(4)
+        cells[0].metric("Confirmed trades", f"{interim['trade_count']:,}")
+        cells[1].metric("Position value change", cents(interim["value_change"])
+                        if interim["value_change"] is not None else "n/a (incomplete)")
+        cells[2].metric("Trade cash", cents(interim["trade_cash"]))
+        cells[3].metric(
+            "Profit and loss",
+            cents(interim["pnl"]) if interim["pnl"] is not None else "n/a (incomplete)",
+            delta=(f"{interim['pnl_pct'] * 100:.2f}% of last account value"
+                   if interim["pnl_pct"] is not None else None),
+        )
+        st.caption(
+            f"Window {interim['anchor_date']} to today. Position-level profit and loss only, "
+            "marked at delayed third-party quotes. This is **not** a time-weighted return and "
+            "cannot be linked with the monthly series below: confirmations carry no cash "
+            "balance, deposit, dividend or corporate-action data, so the denominator a return "
+            "needs does not exist between statements."
+        )
+        for note in interim["assumptions"]:
+            st.warning(note)
+
     st.subheader("Monthly time-weighted return")
-    st.pyplot(charts["02_monthly_returns.png"], width="stretch")
-    if "03_cumulative_and_drawdown.png" in charts:
+    st.plotly_chart(charts["02_monthly_returns"], use_container_width=True)
+    if "03_cumulative_and_drawdown" in charts:
         st.subheader("Cumulative return and drawdown")
-        st.pyplot(charts["03_cumulative_and_drawdown.png"], width="stretch")
+        st.plotly_chart(charts["03_cumulative_and_drawdown"], use_container_width=True)
 
     st.subheader("Monthly detail")
     display = pd.DataFrame(
@@ -334,8 +404,8 @@ with tab_risk:
             rows = [
                 ("Annualized volatility", percent(metrics["volatility_annualized"])),
                 ("Annualized downside deviation", percent(metrics["downside_deviation_annualized"])),
-                ("Sharpe ratio", A.fmt_ratio(metrics["sharpe"])),
-                ("Sortino ratio", A.fmt_ratio(metrics["sortino"])),
+                ("Sharpe ratio", fmt_ratio(metrics["sharpe"])),
+                ("Sortino ratio", fmt_ratio(metrics["sortino"])),
                 ("Max drawdown", percent(metrics["max_drawdown"])),
                 ("Positive months", percent(metrics["hit_rate"])),
             ]
@@ -410,16 +480,16 @@ with tab_risk:
             "Statements do not disclose cash flows per asset class, so class change "
             "includes intra-class trading. This is a reconciliation, not a Brinson attribution."
         )
-    if "04_asset_allocation.png" in charts:
-        st.pyplot(charts["04_asset_allocation.png"], width="stretch")
+    if "04_asset_allocation" in charts:
+        st.plotly_chart(charts["04_asset_allocation"], use_container_width=True)
 
 with tab_income:
-    if "05_income.png" in charts:
+    if "05_income" in charts:
         st.subheader("Dividends and interest")
-        st.pyplot(charts["05_income.png"], width="stretch")
-    if "06_realized_unrealized.png" in charts:
+        st.plotly_chart(charts["05_income"], use_container_width=True)
+    if "06_realized_unrealized" in charts:
         st.subheader("Realized vs unrealized")
-        st.pyplot(charts["06_realized_unrealized.png"], width="stretch")
+        st.plotly_chart(charts["06_realized_unrealized"], use_container_width=True)
     cells = st.columns(3)
     cells[0].metric("Realized short-term", money(metrics["realized_st"]))
     cells[1].metric("Realized long-term", money(metrics["realized_lt"]))
@@ -432,7 +502,14 @@ with tab_income:
         st.caption("All realized gains are short-term, taxed as ordinary income.")
 
 with tab_premium:
-    transactions = A.transaction_frame(records, include_pending=True)
+    transactions = combined_transaction_frame(records, confirm_trades, include_pending=True)
+    if not confirm_trades.empty:
+        st.caption(
+            "Trades after the newest statement period come from trade confirmations, so the "
+            "current month is populated before its statement arrives. The Source column says "
+            "which feed each row came from. Confirmations print no realized gain, so the "
+            "Income & gains tab stays the authoritative realized total."
+        )
     if transactions.empty:
         st.info(
             "No transaction detail was parsed from these statements. Only statements "
@@ -472,7 +549,8 @@ with tab_premium:
         options_only = row_two[3].checkbox(
             "Options only",
             value=True,
-            help="Premium figures always ignore non-option rows; this also filters the table below.",
+            help="Filters the transaction table below. Premium figures ignore non-option rows"
+                 " whether this is ticked or not.",
         )
 
         filtered = transactions
@@ -497,11 +575,10 @@ with tab_premium:
             filtered = filtered[filtered["action"].isin(chosen_actions)]
         if chosen_categories:
             filtered = filtered[filtered["category"].isin(chosen_categories)]
-        if options_only:
-            filtered = filtered[filtered["is_option"]]
 
-        summary = A.premium_summary(filtered)
-        pending_rows = int((~filtered["settled"]).sum())
+        option_rows = filtered[filtered["is_option"]]
+        summary = premium_summary(option_rows)
+        pending_rows = int((~option_rows["settled"]).sum())
 
         st.subheader("Option premium")
         cells = st.columns(4)
@@ -533,7 +610,7 @@ with tab_premium:
             f"{cents(summary['gross_notional'])}."
         )
 
-        monthly = A.premium_by_month(filtered)
+        monthly = premium_by_month(option_rows)
         if not monthly.empty:
             st.subheader("Premium by month")
             st.bar_chart(monthly.set_index("month")["premium_net"], height=260)
@@ -562,7 +639,7 @@ with tab_premium:
                 },
             )
 
-        by_symbol = A.premium_by_symbol(filtered)
+        by_symbol = premium_by_symbol(option_rows)
         if not by_symbol.empty:
             st.subheader("Premium by symbol")
             st.dataframe(
@@ -590,11 +667,27 @@ with tab_premium:
                 },
             )
 
-        st.subheader(f"Transactions ({len(filtered):,} row(s))")
+        cash_rows = filtered[~filtered["is_option"]]
+        if option_rows.empty and not cash_rows.empty:
+            st.subheader("Non-option rows in this selection")
+            cells = st.columns(2)
+            cells[0].metric("Net cash", cents(float(cash_rows["amount"].sum())))
+            cells[1].metric("Rows", f"{len(cash_rows):,}")
+            st.caption(
+                "Deposits, withdrawals, dividends, interest and share trades carry no option "
+                "premium, so they are absent from the figures above. A deposit is a cash "
+                "movement, not performance — see the Overview tab for how flows are handled."
+            )
+
+        table = filtered[filtered["is_option"]] if options_only else filtered
+        if table.empty and not filtered.empty:
+            st.info("Every row in this selection is a non-option row. Untick **Options only** to list them.")
+        st.subheader(f"Transactions ({len(table):,} row(s))")
         st.dataframe(
-            filtered[
+            table[
                 [
                     "trade_date",
+                    "source",
                     "settled",
                     "category",
                     "action",
@@ -613,6 +706,7 @@ with tab_premium:
             ].rename(
                 columns={
                     "trade_date": "Trade date",
+                    "source": "Source",
                     "settled": "Settled",
                     "category": "Category",
                     "action": "Action",
@@ -631,6 +725,7 @@ with tab_premium:
             ),
             hide_index=True,
             width="stretch",
+            height=740,
             column_config={
                 "Strike": st.column_config.NumberColumn(format="$%.2f"),
                 "Price": st.column_config.NumberColumn(format="$%.4f"),
@@ -641,7 +736,7 @@ with tab_premium:
         )
         st.download_button(
             "filtered_transactions.csv",
-            filtered.to_csv(index=False),
+            table.to_csv(index=False),
             file_name="filtered_transactions.csv",
         )
 
@@ -696,16 +791,171 @@ with tab_positions:
             },
         )
         if chosen == latest_month:
-            if "08_holdings_pnl.png" in charts:
-                st.pyplot(charts["08_holdings_pnl.png"], width="stretch")
-            if "09_position_exposure.png" in charts:
-                st.pyplot(charts["09_position_exposure.png"], width="stretch")
+            if "08_holdings_pnl" in charts:
+                st.plotly_chart(charts["08_holdings_pnl"], use_container_width=True)
+            if "09_position_exposure" in charts:
+                st.plotly_chart(charts["09_position_exposure"], use_container_width=True)
         else:
             st.caption("Position charts are drawn for the most recent statement period.")
         st.caption(
             "Negative market value is a short position. Short options carry assignment "
             "risk beyond their market value, and 2x/3x leveraged ETFs compound daily, so "
             "their returns are path-dependent."
+        )
+
+with tab_live:
+    st.subheader("Positions rolled forward from the newest statement")
+    if confirm_error:
+        st.warning(f"Could not read the confirmation feed: {confirm_error}")
+    live = positions_module.rollforward(records, confirm_trades, marks=quote_marks)
+    if live.empty:
+        st.info(
+            "No open positions were derived. This needs a statement with a holdings "
+            "section; trade confirmations are then applied on top of it."
+        )
+    else:
+        anchor = max(record["period_end"] for record in records)
+        total, complete = positions_module.marked_total(live)
+        cells = st.columns(3)
+        cells[0].metric("Open positions", f"{len(live):,}")
+        cells[1].metric("Marked value", cents(total) if complete else "n/a (incomplete)")
+        cells[2].metric("Anchored on", str(anchor))
+        st.caption(
+            "Marks are delayed third-party quotes from Yahoo, not statement figures. "
+            "Confirmations carry no cash, margin, dividend or corporate-action data, so no "
+            "account value, time-weighted return or risk statistic is derived here - those "
+            "stay statement-derived on the other tabs."
+        )
+        if not complete:
+            st.warning(
+                "At least one open position has no market mark, so the marked value reads "
+                "n/a rather than a total that silently omits it. An unpriced short option "
+                "would make the account look better than it is."
+            )
+        for warning in positions_module.warnings(live):
+            st.warning(warning)
+        st.dataframe(
+            live[
+                [
+                    "key", "symbol", "asset_class", "quantity", "anchor_quantity",
+                    "pending_quantity", "confirm_quantity", "price", "entry_price",
+                    "unrealized_pct", "price_as_of", "market_value", "cost_basis",
+                    "unrealized", "source", "status",
+                ]
+            ].rename(
+                columns={
+                    "key": "Position",
+                    "symbol": "Symbol",
+                    "asset_class": "Class",
+                    "quantity": "Qty",
+                    "anchor_quantity": "From statement",
+                    "pending_quantity": "From pending",
+                    "confirm_quantity": "From confirms",
+                    "price": "Mark",
+                    "entry_price": "Traded price",
+                    "unrealized_pct": "P/L change %",
+                    "price_as_of": "Mark as of",
+                    "market_value": "Value",
+                    "cost_basis": "Cost basis",
+                    "unrealized": "Unrealized",
+                    "source": "Source",
+                    "status": "Status",
+                }
+            ),
+            hide_index=True,
+            width="stretch",
+            height=740,
+            column_config={
+                "Mark": st.column_config.NumberColumn(format="$%.4f"),
+                "Traded price": st.column_config.NumberColumn(format="$%.4f"),
+                "P/L change %": st.column_config.NumberColumn(format="percent"),
+                "Value": st.column_config.NumberColumn(format="$%.2f"),
+                "Cost basis": st.column_config.NumberColumn(format="$%.2f"),
+                "Unrealized": st.column_config.NumberColumn(format="$%.2f"),
+            },
+        )
+        st.caption(
+            "Traded price is the entry price per share or per contract implied by the cost "
+            "basis, so it carries the commission. P/L change % is the unrealized figure "
+            "against the capital or premium at risk: for a short option it reads as the "
+            "share of the premium captured so far."
+        )
+
+with tab_reconcile:
+    st.subheader("Statement versus confirmation feed")
+    st.caption(
+        "Trades enter the database from eConfirm email; the statement is the audit. A row "
+        "the statement prints with no confirmation behind it is a gap in ingestion, and a "
+        "confirmation the statement does not print is a parser miss."
+    )
+    if confirm_trades.empty:
+        st.info("No trade confirmations have been ingested yet. Run ./run.sh ingest.")
+    else:
+        table, summary = reconcile_module.reconcile_all(records, confirm_trades)
+        cells = st.columns(4)
+        cells[0].metric("Matched", f"{summary['matched']:,}")
+        cells[1].metric("Mismatched", f"{summary['amount_mismatch']:,}")
+        cells[2].metric("Missing confirmation", f"{summary['statement_only']:,}")
+        cells[3].metric("Missing from statement", f"{summary['confirm_only']:,}")
+        st.caption(
+            f"{summary['not_confirmable']:,} row(s) are not confirmable - dividends, "
+            "interest, tax withholding, fees, journals and expirations produce no "
+            f"confirmation. {summary['before_confirm_feed']:,} row(s) predate the first "
+            "confirmation held and cannot be audited."
+        )
+        if summary["discrepancies"] == 0:
+            st.success("Every confirmable statement row ties to a confirmation.")
+        else:
+            st.warning(
+                f"{summary['discrepancies']:,} discrepancy(ies). Where the same contract "
+                "traded twice in a day at the same price, the row pairing is arbitrary: the "
+                "totals are right but an individual pairing may look wrong."
+            )
+        anchor_end = max(record["period_end"] for record in records)
+        stranded = table[(table["status"] == "confirm_only")
+                         & (table["period_end"] == anchor_end)]
+        if not stranded.empty:
+            st.error(
+                f"{len(stranded)} confirmation(s) dated on or before {anchor_end} appear in "
+                "neither that statement's Transaction Details nor its Pending / Open Activity "
+                "section. A trade that fills in the last days of a period settles after it and "
+                "prints only as pending, so those are matched already; anything left here is a "
+                "parser gap or a trade Schwab carried into the next period, and the statement "
+                "is authoritative through its period end so the rollforward does not apply it. "
+                "Affected: " + ", ".join(str(key) for key in stranded["key"])
+            )
+        status_filter = st.multiselect(
+            "Status", sorted(table["status"].unique()),
+            default=[s for s in ("amount_mismatch", "statement_only", "confirm_only")
+                     if s in set(table["status"])],
+        )
+        shown = table[table["status"].isin(status_filter)] if status_filter else table
+        st.dataframe(
+            shown.rename(
+                columns={
+                    "period_end": "Period",
+                    "status": "Status",
+                    "key": "Position",
+                    "trade_date": "Trade date",
+                    "side": "Side",
+                    "quantity": "Qty",
+                    "statement_price": "Stmt price",
+                    "confirm_price": "Confirm price",
+                    "statement_amount": "Stmt amount",
+                    "confirm_amount": "Confirm amount",
+                    "difference": "Difference",
+                    "category": "Category",
+                    "description": "Description",
+                    "note": "Note",
+                }
+            ),
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "Stmt amount": st.column_config.NumberColumn(format="$%.2f"),
+                "Confirm amount": st.column_config.NumberColumn(format="$%.2f"),
+                "Difference": st.column_config.NumberColumn(format="$%.2f"),
+            },
         )
 
 with tab_data:
@@ -757,7 +1007,17 @@ with tab_data:
             f"${max(pending_residuals):,.2f}."
         )
 
-    report = A.build_report(frame, metrics, attribution, risk_free, settled_transactions)
+    report_reconciliation = None
+    report_positions = None
+    if not confirm_trades.empty:
+        report_reconciliation, _ = reconcile_module.reconcile_all(records, confirm_trades)
+        report_positions = positions_module.rollforward(
+            records, confirm_trades, marks=quote_marks
+        )
+    report = build_report(
+        frame, metrics, attribution, risk_free, settled_transactions,
+        reconciliation=report_reconciliation, positions=report_positions, interim=interim,
+    )
     st.subheader("Written report")
     st.code(report, language="text")
 
@@ -775,7 +1035,7 @@ with tab_data:
     if not settled_transactions.empty:
         files.append(("transactions.csv", settled_transactions.to_csv(index=False)))
         files.append(
-            ("premium_by_month.csv", A.premium_by_month(settled_transactions).to_csv(index=False))
+            ("premium_by_month.csv", premium_by_month(settled_transactions).to_csv(index=False))
         )
     for start in range(0, len(files), 4):
         columns = st.columns(4)

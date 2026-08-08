@@ -25,7 +25,7 @@ from urllib.parse import urlsplit, urlunsplit
 import psycopg
 from psycopg.types.json import Jsonb
 
-import analyze_schwab as A
+from . import domain as A
 
 SCHEMA = "schwab"
 PARSER_VERSION = "2026.08"
@@ -250,6 +250,69 @@ def ensure_schema(conn: psycopg.Connection) -> None:
             )
             """
         )
+        # Confirm-sourced trades hang off the email they arrived in, never off a
+        # statement: statement child rows are deleted and reinserted on every
+        # re-parse, and the trade ledger must survive that.
+        cur.execute(
+            f"""
+            create table if not exists {SCHEMA}.emails (
+                id bigserial primary key,
+                body_sha256 text not null unique,
+                message_id text unique,
+                gmail_uid text,
+                internal_date timestamptz,
+                confirm_date date,
+                account_tail text,
+                trade_count integer not null default 0,
+                status text not null default 'ok',
+                error text,
+                parser_version text,
+                ingested_at timestamptz not null default now()
+            )
+            """
+        )
+        cur.execute(
+            f"""
+            create table if not exists {SCHEMA}.trades (
+                id bigserial primary key,
+                email_id bigint not null
+                    references {SCHEMA}.emails(id) on delete cascade,
+                seq integer not null,
+                trade_date date,
+                settle_date date,
+                symbol text,
+                occ_symbol text,
+                description text,
+                action text,
+                intent text,
+                quantity numeric(20,4),
+                price numeric(20,4),
+                principal numeric(20,4),
+                commission numeric(20,4),
+                industry_fee numeric(20,4),
+                net_amount numeric(20,4),
+                is_option boolean not null default false,
+                option_type text,
+                strike numeric(20,4),
+                expiry date,
+                cusip text,
+                account_tail text,
+                unique (email_id, seq)
+            )
+            """
+        )
+        cur.execute(
+            f"""
+            create table if not exists {SCHEMA}.quotes (
+                symbol text primary key,
+                price numeric(20,4),
+                as_of date,
+                source text,
+                error text,
+                fetched_at timestamptz not null default now()
+            )
+            """
+        )
         cur.execute(
             f"create index if not exists holdings_statement_idx "
             f"on {SCHEMA}.holdings (statement_id)"
@@ -276,6 +339,22 @@ def ensure_schema(conn: psycopg.Connection) -> None:
         cur.execute(
             f"create index if not exists cash_flows_statement_idx "
             f"on {SCHEMA}.cash_flows (statement_id)"
+        )
+        cur.execute(
+            f"create index if not exists trades_email_idx on {SCHEMA}.trades (email_id)"
+        )
+        cur.execute(
+            f"create index if not exists trades_trade_date_idx on {SCHEMA}.trades (trade_date)"
+        )
+        cur.execute(
+            f"create index if not exists trades_symbol_idx on {SCHEMA}.trades (symbol)"
+        )
+        cur.execute(
+            f"create index if not exists trades_occ_idx on {SCHEMA}.trades (occ_symbol)"
+        )
+        cur.execute(
+            f"create index if not exists emails_confirm_date_idx "
+            f"on {SCHEMA}.emails (confirm_date)"
         )
     conn.commit()
 
@@ -574,38 +653,178 @@ def load_records(conn: psycopg.Connection) -> list[dict]:
 
 
 # --------------------------------------------------------------------------
-def main(argv=None) -> int:
-    import argparse
+# confirm emails and trades
+# --------------------------------------------------------------------------
+def body_digest(text: str) -> str:
+    """Digest of an email body with per-send noise removed.
 
-    parser = argparse.ArgumentParser(description="Statement database utilities")
-    parser.add_argument(
-        "command", choices=["initdb", "inventory"], help="initdb creates the database and schema"
-    )
-    args = parser.parse_args(argv)
+    Two forwards of the same confirm must collide, so the tracking URLs are
+    stripped first - Schwab regenerates their `qs=` tokens on every send. Message-ID
+    is not enough on its own: forwarding rewrites it, and a second forward would
+    then double-count every trade in the mail.
+    """
+    stripped = re.sub(r"https?://\S+", "", text or "")
+    return hashlib.sha256(re.sub(r"\s+", " ", stripped).strip().encode("utf-8")).hexdigest()
 
-    if args.command == "initdb":
-        created = initialize()
-        name = database_name()
-        print(f"database {name}: {'created' if created else 'already present'}")
-        print(f"schema {SCHEMA}: ready")
-        return 0
 
-    with connect() as conn:
-        rows = statement_index(conn)
-    if not rows:
-        print("No statements stored.")
-        return 0
-    print(f"{len(rows)} statement(s) stored:")
-    for row in rows:
-        print(
-            f"  {row['period_start']} to {row['period_end']}  "
-            f"{A.fmt_money(clean(row['ending_value']))}  "
-            f"{row['transaction_rows']} transaction rows  {row['file']}"
+def known_bodies(conn: psycopg.Connection) -> dict[str, int]:
+    with conn.cursor() as cur:
+        cur.execute(f"select body_sha256, id from {SCHEMA}.emails")
+        return dict(cur.fetchall())
+
+
+def save_confirm(conn: psycopg.Connection, meta: dict, trades: list) -> int:
+    """Upsert one confirm email and replace its trades. Idempotent per body digest."""
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            insert into {SCHEMA}.emails
+                (body_sha256, message_id, gmail_uid, internal_date, confirm_date,
+                 account_tail, trade_count, status, error, parser_version)
+            values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            on conflict (body_sha256) do update set
+                message_id = excluded.message_id,
+                gmail_uid = excluded.gmail_uid,
+                internal_date = excluded.internal_date,
+                confirm_date = excluded.confirm_date,
+                account_tail = excluded.account_tail,
+                trade_count = excluded.trade_count,
+                status = excluded.status,
+                error = excluded.error,
+                parser_version = excluded.parser_version,
+                ingested_at = now()
+            returning id
+            """,
+            (
+                meta["body_sha256"],
+                meta.get("message_id"),
+                meta.get("gmail_uid"),
+                meta.get("internal_date"),
+                as_date(meta.get("confirm_date")),
+                meta.get("account_tail"),
+                len(trades),
+                meta.get("status", "ok"),
+                meta.get("error"),
+                PARSER_VERSION,
+            ),
         )
-    return 0
+        email_id = cur.fetchone()[0]
+
+        cur.execute(f"delete from {SCHEMA}.trades where email_id = %s", (email_id,))
+        if trades:
+            rows = []
+            for trade in trades:
+                row = [email_id]
+                for key in A.TRADE_COLUMNS:
+                    value = trade.get(key)
+                    if key in A.TRADE_NUMERIC:
+                        value = clean(value)
+                    elif key in ("trade_date", "settle_date", "expiry"):
+                        value = as_date(value)
+                    elif key == "is_option":
+                        value = bool(value)
+                    row.append(value)
+                rows.append(row)
+            columns = ", ".join(A.TRADE_COLUMNS)
+            cur.executemany(
+                f"insert into {SCHEMA}.trades (email_id, {columns}) "
+                f"values ({', '.join(['%s'] * (len(A.TRADE_COLUMNS) + 1))})",
+                rows,
+            )
+    conn.commit()
+    return email_id
 
 
-if __name__ == "__main__":
-    import sys
+def delete_confirm(conn: psycopg.Connection, body_sha256: str) -> bool:
+    with conn.cursor() as cur:
+        cur.execute(f"delete from {SCHEMA}.emails where body_sha256 = %s", (body_sha256,))
+        removed = cur.rowcount
+    conn.commit()
+    return bool(removed)
 
-    sys.exit(main())
+
+def trade_index(conn: psycopg.Connection) -> list[dict]:
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            select body_sha256, confirm_date, trade_count, status, error, ingested_at
+              from {SCHEMA}.emails
+             order by confirm_date desc nulls last, ingested_at desc
+            """
+        )
+        columns = [description.name for description in cur.description]
+        return [dict(zip(columns, row)) for row in cur.fetchall()]
+
+
+def load_trades(conn: psycopg.Connection):
+    """Confirm trades as a DataFrame: floats not Decimal, dates not timestamps."""
+    import pandas as pd
+
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            select t.*, e.confirm_date, e.body_sha256
+              from {SCHEMA}.trades t
+              join {SCHEMA}.emails e on e.id = t.email_id
+             order by t.trade_date, t.email_id, t.seq
+            """
+        )
+        columns = [description.name for description in cur.description]
+        rows = [dict(zip(columns, row)) for row in cur.fetchall()]
+
+    frame = pd.DataFrame(rows, columns=columns if rows else [*A.TRADE_COLUMNS, "confirm_date"])
+    for column in A.TRADE_NUMERIC:
+        if column in frame:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    if not frame.empty:
+        frame["month"] = pd.to_datetime(frame["trade_date"]).dt.strftime("%Y-%m")
+    return frame
+
+
+# --------------------------------------------------------------------------
+# quotes
+# --------------------------------------------------------------------------
+def save_quotes(conn: psycopg.Connection, results: dict) -> int:
+    rows = [
+        [
+            symbol,
+            clean(result.get("price")),
+            as_date(result.get("as_of")),
+            result.get("source"),
+            result.get("error"),
+        ]
+        for symbol, result in results.items()
+    ]
+    if not rows:
+        return 0
+    with conn.cursor() as cur:
+        cur.executemany(
+            f"""
+            insert into {SCHEMA}.quotes (symbol, price, as_of, source, error, fetched_at)
+            values (%s, %s, %s, %s, %s, now())
+            on conflict (symbol) do update set
+                price = excluded.price,
+                as_of = excluded.as_of,
+                source = excluded.source,
+                error = excluded.error,
+                fetched_at = now()
+            """,
+            rows,
+        )
+    conn.commit()
+    return len(rows)
+
+
+def load_quotes(conn: psycopg.Connection) -> dict:
+    with conn.cursor() as cur:
+        cur.execute(f"select symbol, price, as_of, source, error, fetched_at from {SCHEMA}.quotes")
+        return {
+            row[0]: {
+                "price": clean(row[1]),
+                "as_of": row[2],
+                "source": row[3],
+                "error": row[4],
+                "fetched_at": row[5],
+            }
+            for row in cur.fetchall()
+        }
