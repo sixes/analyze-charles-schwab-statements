@@ -12,9 +12,18 @@ import logging
 import sys
 
 from .. import notify, store
+from ..domain import NETWORK_ATTEMPTS, retry
 from . import mailbox, parse
 
 log = logging.getLogger(__name__)
+
+
+def _note_retry(what: str):
+    """Report a swallowed attempt on stderr, where run.sh timestamps it into the log."""
+    def note(attempt: int, exc: Exception) -> None:
+        print(f"{what} attempt {attempt} of {NETWORK_ATTEMPTS} failed: {exc}; retrying",
+              file=sys.stderr)
+    return note
 
 
 def _refresh_quotes(conn) -> tuple[int, int, int, list]:
@@ -56,13 +65,15 @@ def run(days: int = 7, reprocess: bool = False, dry_run: bool = False,
         return code
 
     try:
-        messages = mailbox.fetch(days=days)
+        messages = retry(lambda: mailbox.fetch(days=days), on_retry=_note_retry("mailbox"))
     except mailbox.MailboxError as exc:
-        outcome.update(status="failed", reason="imap login", error=str(exc))
+        outcome.update(status="failed", reason=exc.reason,
+                       error=f"{exc} (after {NETWORK_ATTEMPTS} attempts)")
         print(f"mailbox unreachable: {exc}", file=sys.stderr)
         return finish(1)
     except Exception as exc:
-        outcome.update(status="failed", reason="mailbox error", error=str(exc))
+        outcome.update(status="failed", reason="mailbox error",
+                       error=f"{exc} (after {NETWORK_ATTEMPTS} attempts)")
         print(f"mailbox error: {exc}", file=sys.stderr)
         return finish(1)
 

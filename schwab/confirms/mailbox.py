@@ -26,14 +26,23 @@ IMAP_DATE = "%d-%b-%Y"
 
 
 class MailboxError(RuntimeError):
-    """Login, connection or search failure - reported, never silently swallowed."""
+    """Login, connection or search failure - reported, never silently swallowed.
+
+    `reason` is the short label the notification subject carries, so an unreachable host
+    does not read as a rejected password and send the reader after the app password.
+    """
+
+    def __init__(self, message: str, reason: str = "mailbox error"):
+        super().__init__(message)
+        self.reason = reason
 
 
 def credentials() -> tuple[str, str]:
     user = os.environ.get("GMAIL_USER", "").strip()
     password = os.environ.get("GMAIL_APP_PASSWORD", "").strip()
     if not user or not password:
-        raise MailboxError("GMAIL_USER and GMAIL_APP_PASSWORD must be set in .env")
+        raise MailboxError("GMAIL_USER and GMAIL_APP_PASSWORD must be set in .env",
+                           reason="gmail credentials missing")
     return user, password
 
 
@@ -104,21 +113,23 @@ def fetch(days: int = 7, subject_hint: str = SUBJECT_HINT, limit: int = 200) -> 
     try:
         client = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
     except OSError as exc:
-        raise MailboxError(f"cannot reach {IMAP_HOST}: {exc}") from exc
+        raise MailboxError(f"cannot reach {IMAP_HOST}: {exc}",
+                           reason="imap unreachable") from exc
 
     try:
         try:
             client.login(user, password)
         except imaplib.IMAP4.error as exc:
-            raise MailboxError(f"imap login rejected for {user}: {exc}") from exc
+            raise MailboxError(f"imap login rejected for {user}: {exc}",
+                               reason="imap login") from exc
 
         status, _ = client.select(FOLDER, readonly=True)
         if status != "OK":
-            raise MailboxError(f"cannot select {FOLDER}")
+            raise MailboxError(f"cannot select {FOLDER}", reason="imap folder")
 
         status, data = client.search(None, "SINCE", since, "SUBJECT", f'"{subject_hint}"')
         if status != "OK":
-            raise MailboxError("imap search failed")
+            raise MailboxError("imap search failed", reason="imap search")
 
         uids = (data[0] or b"").split()
         if not uids:

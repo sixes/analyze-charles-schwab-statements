@@ -302,6 +302,19 @@ messages, so the search stays narrow (a `SINCE` floor plus a subject match). The
 the anchor rather than the From address, because both the direct Schwab mail and the
 forwarded copy have to match.
 
+Transient network failure is not news. A single failed DNS lookup for `imap.gmail.com`
+used to mail a full `INGEST FAILED`, and the tick five minutes later succeeded — so the
+IMAP fetch and the SMTP send both run through `domain.retry`, five attempts with a linear
+2/4/6/8-second backoff, and only the fifth failure is reported. Each swallowed attempt is
+still printed, so the log shows what happened rather than hiding it. The total wait has to
+stay near those 20 seconds: `flock -n` is **non-blocking**, so a pass that lingers does not
+delay the next tick, it makes that tick skip. `MailboxError` carries its own `reason`
+(`imap unreachable`, `imap login`, `imap search`, `gmail credentials missing`) and the
+subject uses it, because labelling an unresolved host as a rejected login sends the reader
+after the app password for a network outage. Parsing and the database pass are deliberately
+**not** retried: a parse failure is deterministic, and the ingestion loop's counters are
+incremented as it goes, so replaying it would double what it reports.
+
 A notification fires for every confirmation *processed* — success, partial or failure — and
 stays **silent when a tick finds nothing new**. That exception is deliberate: 288 ticks a
 day of "nothing happened" would train the notification to be muted, defeating its purpose.

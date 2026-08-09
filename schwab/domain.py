@@ -6,6 +6,7 @@ pandas, matplotlib or the PDF stack.
 
 from __future__ import annotations
 
+import time
 from datetime import date, timedelta
 from decimal import Decimal
 
@@ -101,6 +102,34 @@ OPTION_MULTIPLIER = 100
 
 CREDIT_ACTIONS = ("Sale", "ShortSale", "SellShort")
 DEBIT_ACTIONS = ("Purchase", "CoverShort", "BuyToClose", "Buy")
+
+# Gmail resolution and SMTP fail intermittently, and one blip is not news: a single
+# failed DNS lookup used to report a whole failed ingestion. Five attempts with a linear
+# backoff wait 2+4+6+8 = 20 seconds in total, which has to stay small - cron fires every
+# five minutes and run.sh takes a *non-blocking* flock, so a pass that lingers does not
+# delay the next tick, it makes that tick skip entirely.
+NETWORK_ATTEMPTS = 5
+RETRY_BACKOFF = 2.0
+
+
+def retry(operation, attempts: int = NETWORK_ATTEMPTS, backoff: float = RETRY_BACKOFF,
+          on_retry=None):
+    """Call `operation()`, retrying failures up to `attempts` times in total.
+
+    Re-raises the last exception, so a caller's own error handling and its message stay
+    exactly as they were - the only change is that they are reached once the transient
+    explanations are exhausted rather than on the first stumble. `on_retry(attempt, exc)`
+    is where the noise goes, so each swallowed attempt is still visible in the log.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            return operation()
+        except Exception as exc:
+            if attempt == attempts:
+                raise
+            if on_retry is not None:
+                on_retry(attempt, exc)
+            time.sleep(backoff * attempt)
 
 
 def occ_symbol(symbol: str, expiry: date, option_type: str, strike) -> str | None:

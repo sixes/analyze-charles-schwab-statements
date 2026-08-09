@@ -20,7 +20,7 @@ import smtplib
 from email.message import EmailMessage
 from html import escape
 
-from .domain import fmt_money, fmt_qty
+from .domain import NETWORK_ATTEMPTS, fmt_money, fmt_qty, retry
 
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 465
@@ -57,12 +57,18 @@ def send(subject: str, body: str, html: str | None = None) -> bool:
         # the fallback and this becomes what a client renders when it can.
         message.add_alternative(html, subtype="html")
 
-    try:
+    def deliver() -> None:
         with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=30) as smtp:
             smtp.login(user, password)
             smtp.send_message(message)
+
+    try:
+        retry(deliver, on_retry=lambda attempt, exc: log.warning(
+            "notification attempt %s of %s failed: %s; retrying",
+            attempt, NETWORK_ATTEMPTS, exc))
     except Exception as exc:
-        log.warning("notification to %s failed: %s", ", ".join(to), exc)
+        log.warning("notification to %s failed after %s attempts: %s",
+                    ", ".join(to), NETWORK_ATTEMPTS, exc)
         return False
     return True
 
