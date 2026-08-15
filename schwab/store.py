@@ -313,6 +313,29 @@ def ensure_schema(conn: psycopg.Connection) -> None:
             )
             """
         )
+        # Which price bands the monitor has already mailed. The unique key carries no
+        # date: a band is news once for the life of a position, not once a day, so a
+        # holding sitting at +30% stays silent instead of mailing every session.
+        # entry_price is stored because it is the reference the move was measured
+        # against - when a position is added to or reopened the basis changes, and the
+        # old bands measured a different position.
+        cur.execute(
+            f"""
+            create table if not exists {SCHEMA}.alerts (
+                id bigserial primary key,
+                position_key text not null,
+                direction text not null,
+                band integer not null,
+                entry_price numeric(20,4),
+                price numeric(20,4),
+                move_pct double precision,
+                quantity numeric(20,4),
+                session_date date,
+                created_at timestamptz not null default now(),
+                unique (position_key, direction, band)
+            )
+            """
+        )
         cur.execute(
             f"""
             create table if not exists {SCHEMA}.settings (
@@ -837,6 +860,111 @@ def load_quotes(conn: psycopg.Connection) -> dict:
             }
             for row in cur.fetchall()
         }
+
+
+# --------------------------------------------------------------------------
+# price alerts
+# --------------------------------------------------------------------------
+# A cent of slack: the basis is rebuilt from stored numerics every run, so an
+# unchanged position must compare equal rather than drift on rounding.
+BASIS_TOLERANCE = 0.005
+
+
+def clear_rebased_alerts(conn: psycopg.Connection, position_key: str, entry_price) -> int:
+    """Forget a position's reported bands when they were measured against another basis.
+
+    Adding to a holding or reopening a closed one moves the entry price, and every band
+    recorded against the old one now describes a different position. Keeping them would
+    silence a genuine move on the new basis, so they are dropped and the current bands
+    are reported afresh.
+    """
+    basis = clean(entry_price)
+    if basis is None:
+        return 0
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            delete from {SCHEMA}.alerts
+             where position_key = %s
+               and (entry_price is null or abs(entry_price - %s) > %s)
+            """,
+            (position_key, basis, BASIS_TOLERANCE),
+        )
+        removed = cur.rowcount
+    conn.commit()
+    return removed
+
+
+def claim_alerts(conn: psycopg.Connection, alerts: list[dict]) -> list[dict]:
+    """Record each band and return only the ones not already reported.
+
+    The insert is the claim, so the unique key does the deduplication inside the
+    database. Two overlapping ticks cannot both take the same band, and a band already
+    mailed is simply not returned.
+    """
+    claimed = []
+    with conn.cursor() as cur:
+        for alert in alerts:
+            cur.execute(
+                f"""
+                insert into {SCHEMA}.alerts
+                    (position_key, direction, band, entry_price, price, move_pct,
+                     quantity, session_date)
+                values (%s, %s, %s, %s, %s, %s, %s, %s)
+                on conflict (position_key, direction, band) do nothing
+                returning id
+                """,
+                (
+                    alert["key"],
+                    alert["direction"],
+                    alert["band"],
+                    clean(alert.get("entry_price")),
+                    clean(alert.get("price")),
+                    clean(alert.get("move_pct")),
+                    clean(alert.get("quantity")),
+                    as_date(alert.get("session_date")),
+                ),
+            )
+            if cur.fetchone() is not None:
+                claimed.append(alert)
+    conn.commit()
+    return claimed
+
+
+def drop_alerts(conn: psycopg.Connection, alerts: list[dict]) -> int:
+    """Release claimed bands so a later tick reports them again.
+
+    Called when the mail did not go out. A band recorded as reported but never sent
+    would be lost for the life of the position, which is the one failure this table
+    must not have.
+    """
+    if not alerts:
+        return 0
+    with conn.cursor() as cur:
+        cur.executemany(
+            f"delete from {SCHEMA}.alerts "
+            f"where position_key = %s and direction = %s and band = %s",
+            [(alert["key"], alert["direction"], alert["band"]) for alert in alerts],
+        )
+    conn.commit()
+    return len(alerts)
+
+
+def alert_index(conn: psycopg.Connection, limit: int = 50) -> list[dict]:
+    """Bands already reported, newest first. For `inventory`."""
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            select position_key, direction, band, entry_price, price, move_pct,
+                   session_date, created_at
+              from {SCHEMA}.alerts
+             order by created_at desc
+             limit %s
+            """,
+            (limit,),
+        )
+        columns = [description.name for description in cur.description]
+        return [dict(zip(columns, row)) for row in cur.fetchall()]
 
 
 # --------------------------------------------------------------------------

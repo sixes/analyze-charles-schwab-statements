@@ -276,6 +276,70 @@ def build_charts(frame: pd.DataFrame, holdings: pd.DataFrame, metrics: dict):
     return figures
 
 
+def interim_breakdown_chart(interim: dict) -> go.Figure:
+    """The confirm-feed window's P&L split into its two components.
+
+    Deliberately kept separate from gain_breakdown_chart: this window has no
+    dividends, interest, fees or corporate-action data, so its components are not
+    the same kind of figure as a statement month's gain components and must not
+    share a chart or a total with them.
+    """
+    value_change = interim.get("value_change") or 0.0
+    trade_cash = interim.get("trade_cash") or 0.0
+    pnl = interim.get("pnl")
+    fig = go.Figure(go.Bar(
+        x=["Position value change", "Trade cash"], y=[value_change, trade_cash],
+        marker_color=[GAIN if value_change >= 0 else LOSS, GAIN if trade_cash >= 0 else LOSS],
+        hovertemplate="%{x}<br>$%{y:,.2f}<extra></extra>",
+    ))
+    fig.add_trace(go.Bar(
+        x=["Profit and loss"], y=[0.0 if pnl is None else float(pnl)],
+        marker_color=PRIMARY, hovertemplate="Profit and loss<br>$%{y:,.2f}<extra></extra>",
+    ))
+    fig.add_hline(y=0, line_width=1, line_color="black")
+    fig.update_layout(showlegend=False)
+    return layout(
+        fig, f"Since {interim.get('anchor_date')} (unaudited, confirm feed)", height=340,
+        y_title="$", tick_format=MONEY, rotate=False,
+    )
+
+
+def gain_breakdown_chart(row: pd.Series) -> go.Figure:
+    """One statemented month's gain, split into its printed components.
+
+    Mirrors the reconciliation build_frame already performs (gain versus market
+    appreciation + dividends/interest + expenses), so the bars are components the
+    statement itself prints, not a re-derivation. Never called with the unaudited
+    interim window - that window has no dividends, interest or expense data, so its
+    P&L is not comparable to a statement month's gain.
+    """
+    components = [
+        ("Market appr.", row.get("market_appreciation")),
+        ("Dividends & interest", row.get("dividends_interest")),
+        ("Realized ST", row.get("st_net")),
+        ("Realized LT", row.get("lt_net")),
+        ("Expenses", row.get("expenses")),
+    ]
+    labels = [label for label, _ in components]
+    values = [0.0 if value is None or pd.isna(value) else float(value) for _, value in components]
+    fig = go.Figure(go.Bar(
+        x=labels, y=values,
+        marker_color=[GAIN if value >= 0 else LOSS for value in values],
+        hovertemplate="%{x}<br>$%{y:,.2f}<extra></extra>",
+    ))
+    total = row.get("gain")
+    fig.add_trace(go.Bar(
+        x=["Total gain"], y=[0.0 if total is None or pd.isna(total) else float(total)],
+        marker_color=PRIMARY, hovertemplate="Total gain<br>$%{y:,.2f}<extra></extra>",
+    ))
+    fig.add_hline(y=0, line_width=1, line_color="black")
+    fig.update_layout(showlegend=False)
+    return layout(
+        fig, f"Gain breakdown — {row.get('month')}", height=380,
+        y_title="$", tick_format=MONEY, rotate=False,
+    )
+
+
 def write_charts(frame: pd.DataFrame, holdings: pd.DataFrame, metrics: dict,
                  directory: Path) -> list:
     """Write every chart as standalone interactive HTML and return the filenames.

@@ -387,3 +387,163 @@ def announce(outcome: dict) -> bool:
     if subject is None:
         return False
     return send(subject, body_for(outcome), html_for(outcome))
+
+
+# --------------------------------------------------------------------------
+# price-move alerts
+# --------------------------------------------------------------------------
+# The move is a price move from the traded price. On anything held short its sign is the
+# opposite of the profit, so every rendering pairs the percentage with its effect - a red
+# "-80%" on a short put would read as precisely the wrong news.
+ALERT_FOOTER = (
+    "Bands are 10% for shares and ETFs and 50% for options, measured against the price "
+    "the position was traded at. Each band is reported once for the life of the "
+    "position, so this stays quiet until something reaches a level it has not reported "
+    "before. Marks are delayed third-party quotes, not statement figures."
+)
+
+
+def _move(alert: dict) -> str:
+    return f"{alert['move_pct']:+.1f}%"
+
+
+def _effect(alert: dict) -> str:
+    """`gain` or `loss`. On a short this is the opposite of the price direction."""
+    return "loss" if alert["adverse"] else "gain"
+
+
+def _effect_color(alert: dict) -> str:
+    return DEBIT_COLOR if alert["adverse"] else CREDIT_COLOR
+
+
+def _side(alert: dict) -> str:
+    return "short" if alert["quantity"] < 0 else "long"
+
+
+def _holding(alert: dict) -> str:
+    """`short 2 SOXL $67 put`, `long 1,000 FNGU`."""
+    return f"{_side(alert)} {fmt_qty(abs(alert['quantity']))} {_contract(alert)}"
+
+
+def describe_alert(alert: dict) -> str:
+    """One alert as a sentence, for the text part and the preview pane."""
+    amount = alert.get("unrealized")
+    standing = f", a {_effect(alert)} of {fmt_money(abs(amount))}" if amount is not None \
+        else f", {'against' if alert['adverse'] else 'for'} the position"
+    return (f"{_holding(alert)}: traded at {fmt_money(alert['entry_price'])}, "
+            f"now {fmt_money(alert['price'])} - {_move(alert)}{standing} "
+            f"({alert['band']}% band)")
+
+
+def alert_subject(alerts: list) -> str | None:
+    """The short line. None means send nothing."""
+    if not alerts:
+        return None
+    if len(alerts) == 1:
+        alert = alerts[0]
+        return f"Schwab: {_contract(alert)} {_move(alert)} - {_effect(alert)}"
+    losses = sum(1 for alert in alerts if alert["adverse"])
+    gains = len(alerts) - losses
+    split = []
+    if gains:
+        split.append(f"{gains} gain{'' if gains == 1 else 's'}")
+    if losses:
+        split.append(f"{losses} loss{'' if losses == 1 else 'es'}")
+    return f"Schwab: {len(alerts)} price alerts - {', '.join(split)}"
+
+
+def alert_body(alerts: list, unevaluated=None) -> str:
+    count = len(alerts)
+    lines = [
+        f"{count} position{'' if count == 1 else 's'} reached a price band "
+        f"{'it has' if count == 1 else 'they have'} not reported before.",
+        "",
+    ]
+    for alert in alerts:
+        lines.append(f"  {describe_alert(alert)}")
+    lines.append("")
+
+    losses = [alert for alert in alerts if alert["adverse"]]
+    gains = [alert for alert in alerts if not alert["adverse"]]
+    if gains and losses:
+        lines.append(f"{len(gains)} moved in your favour, {len(losses)} against you.")
+        lines.append("")
+
+    if any(alert["quantity"] < 0 for alert in alerts):
+        lines.append("A short position gains when its price falls, so the percentage and")
+        lines.append("the gain or loss point opposite ways on those rows.")
+        lines.append("")
+
+    if unevaluated:
+        lines.append("Not measured")
+        for line in unevaluated:
+            lines.append(f"  - {line}")
+        lines.append("")
+
+    lines.append(ALERT_FOOTER)
+    return "\n".join(lines)
+
+
+def _alert_table(alerts: list) -> str:
+    columns = (("Position", "left"), ("Held", "right"), ("Traded", "right"),
+               ("Mark", "right"), ("Move", "right"), ("Band", "right"),
+               ("Effect", "right"))
+    head = "".join(
+        f'<th align="{align}" style="padding:0 10px 6px;border-bottom:2px solid #999;'
+        f'font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;'
+        f'color:{MUTED_COLOR};white-space:nowrap;">{escape(label)}</th>'
+        for label, align in columns
+    )
+
+    rows = []
+    for alert in alerts:
+        color = _effect_color(alert)
+        amount = alert.get("unrealized")
+        effect = f"{_effect(alert)} {fmt_money(abs(amount))}" if amount is not None \
+            else _effect(alert)
+        rows.append(
+            "<tr>"
+            + _cell(escape(_contract(alert)))
+            + _cell(escape(f"{_side(alert)} {fmt_qty(abs(alert['quantity']))}"),
+                    align="right", color=MUTED_COLOR)
+            + _cell(escape(fmt_money(alert["entry_price"])), align="right")
+            + _cell(escape(fmt_money(alert["price"])), align="right")
+            + _cell(f'<strong>{escape(_move(alert))}</strong>', align="right", color=color)
+            + _cell(escape(f"{alert['band']}%"), align="right", color=MUTED_COLOR)
+            + _cell(escape(effect), align="right", color=color)
+            + "</tr>"
+        )
+
+    return ('<table cellpadding="0" cellspacing="0" border="0" role="presentation" '
+            'style="border-collapse:collapse;width:100%;font-size:14px;">'
+            f"<thead><tr>{head}</tr></thead><tbody>{''.join(rows)}</tbody></table>")
+
+
+def alert_html(alerts: list, unevaluated=None) -> str:
+    count = len(alerts)
+    blocks = [_paragraph(
+        f"<strong>{count} position{'' if count == 1 else 's'}</strong> reached a price "
+        f"band {'it has' if count == 1 else 'they have'} not reported before."
+    )]
+    blocks.append(_alert_table(alerts))
+
+    if any(alert["quantity"] < 0 for alert in alerts):
+        blocks.append(_paragraph(
+            "A short position gains when its price falls, so the move and the effect "
+            "point opposite ways on those rows. The colour follows the effect.",
+            color=MUTED_COLOR))
+
+    if unevaluated:
+        blocks.append(_heading("Not measured"))
+        blocks.append(_bullets(unevaluated))
+
+    blocks.append(f'<hr style="margin:24px 0 12px;border:0;border-top:{RULE};">')
+    blocks.append(_paragraph(ALERT_FOOTER, color=MUTED_COLOR))
+    return _page(blocks)
+
+
+def announce_alerts(alerts: list, unevaluated=None) -> bool:
+    subject = alert_subject(alerts)
+    if subject is None:
+        return False
+    return send(subject, alert_body(alerts, unevaluated), alert_html(alerts, unevaluated))

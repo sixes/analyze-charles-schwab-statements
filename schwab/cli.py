@@ -208,6 +208,7 @@ def cmd_inventory(args) -> int:
     with store.connect() as conn:
         rows = store.statement_index(conn)
         trades = store.trade_index(conn)
+        alerts = store.alert_index(conn)
     if rows:
         print(f"{len(rows)} statement(s) stored:")
         for row in rows:
@@ -226,6 +227,15 @@ def cmd_inventory(args) -> int:
             print(f"  {row['confirm_date']}  {row['trade_count']} trade(s){flag}")
     else:
         print("\nNo confirm emails ingested.")
+    if alerts:
+        print(f"\n{len(alerts)} price band(s) already reported:")
+        for row in alerts:
+            when = row["created_at"].astimezone()
+            print(f"  {when:%Y-%m-%d %H:%M}  {row['position_key']:<24} "
+                  f"{row['direction']} {row['band']}%  at "
+                  f"{fmt_money(store.clean(row['price']))} "
+                  f"from {fmt_money(store.clean(row['entry_price']))}")
+        print("  A band is reported once for the life of a position, so these stay silent.")
     return 0
 
 
@@ -239,6 +249,12 @@ def cmd_ingest(args) -> int:
         notify=not args.no_notify,
         quotes=not args.no_quotes,
     )
+
+
+def cmd_monitor(args) -> int:
+    from . import monitor
+
+    return monitor.run(dry_run=args.dry_run, notify=not args.no_notify)
 
 
 def cmd_positions(args) -> int:
@@ -329,6 +345,15 @@ def main(argv=None) -> int:
     ingest.add_argument("--no-notify", action="store_true", help="skip the notification email")
     ingest.add_argument("--no-quotes", action="store_true", help="skip refreshing quotes")
     ingest.set_defaults(func=cmd_ingest)
+
+    monitor = sub.add_parser("monitor",
+                             help="alert on positions that reached a price band")
+    monitor.add_argument("--dry-run", action="store_true",
+                         help="report what would be mailed, recording and sending nothing")
+    monitor.add_argument("--no-notify", action="store_true",
+                         help="record the bands as reported without mailing them, which "
+                              "silences the positions already past a band")
+    monitor.set_defaults(func=cmd_monitor)
 
     positions = sub.add_parser("positions", help="current positions rolled forward from confirms")
     positions.add_argument("--no-quotes", action="store_true", help="omit market marks")

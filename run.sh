@@ -3,6 +3,7 @@
 #
 #   ./run.sh start | stop | restart | status | logs | initdb | inventory
 #   ./run.sh ingest [--days N] [--dry-run]   pull new trade confirmations
+#   ./run.sh monitor [--dry-run]             alert on positions past a price band
 #   ./run.sh cron-install                    print the crontab line to add
 #
 # The password is read from $APP_PASSWORD, else from .env, else from
@@ -16,6 +17,7 @@ PORT=9388
 PID_FILE=.run/app.pid
 LOG_FILE=.run/app.log
 LOCK_FILE=.run/ingest.lock
+MONITOR_LOCK=.run/monitor.lock
 PASS_FILE=.app_password
 ENV_FILE=.env
 
@@ -124,14 +126,37 @@ ingest() {
         | awk '{ print strftime("%Y-%m-%d %H:%M:%S"), $0; fflush() }'
 }
 
+# Cron fires this every ten minutes through the US session. Its own lock file, not
+# the ingest one: the two passes are independent, and a slow quote round trip must
+# not make an ingest tick skip.
+monitor() {
+    load_env
+    mkdir -p "$(dirname "$MONITOR_LOCK")"
+    flock -n "$MONITOR_LOCK" python3 -u -m schwab monitor "$@" 2>&1 \
+        | awk '{ print strftime("%Y-%m-%d %H:%M:%S"), $0; fflush() }'
+}
+
 cron_install() {
-    echo "Add this line with 'crontab -e' (not installed automatically):"
+    echo "Add these lines with 'crontab -e' (not installed automatically):"
     echo
+    echo "# Trade confirmations, every five minutes"
     echo "*/5 * * * * cd $PWD && ./run.sh ingest >> .run/ingest.log 2>&1"
     echo
-    echo "It runs under flock, so overlapping ticks exit immediately."
-    echo "A notification is sent for every confirmation processed, and stays silent"
-    echo "on a tick that finds nothing new."
+    echo "# Price-band alerts, every ten minutes through the US session."
+    echo "# The session runs 21:30-04:00 local, so it crosses midnight: the evening half"
+    echo "# is Mon-Fri and the morning half is Tue-Sat, which is the same five sessions."
+    echo "30,40,50 21 * * 1-5 cd $PWD && ./run.sh monitor >> .run/monitor.log 2>&1"
+    echo "*/10 22,23 * * 1-5 cd $PWD && ./run.sh monitor >> .run/monitor.log 2>&1"
+    echo "*/10 0-3 * * 2-6 cd $PWD && ./run.sh monitor >> .run/monitor.log 2>&1"
+    echo "0 4 * * 2-6 cd $PWD && ./run.sh monitor >> .run/monitor.log 2>&1"
+    echo
+    echo "Both run under flock, so overlapping ticks exit immediately."
+    echo "ingest notifies for every confirmation processed and stays silent on a tick"
+    echo "that finds nothing new. monitor mails a position only when it reaches a price"
+    echo "band it has not reported before, so most ticks send nothing."
+    echo
+    echo "The window is written for daylight saving time. When New York moves to EST in"
+    echo "November the session is 22:30-05:00 local, so shift the hours by one."
 }
 
 case "${1:-start}" in
@@ -143,9 +168,10 @@ case "${1:-start}" in
     initdb) initdb ;;
     inventory) inventory ;;
     ingest) shift; ingest "$@" ;;
+    monitor) shift; monitor "$@" ;;
     cron-install) cron_install ;;
     *)
-        echo "Usage: $0 {start|stop|restart|status|logs|initdb|inventory|ingest|cron-install}" >&2
+        echo "Usage: $0 {start|stop|restart|status|logs|initdb|inventory|ingest|monitor|cron-install}" >&2
         exit 2
         ;;
 esac

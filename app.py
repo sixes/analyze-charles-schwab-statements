@@ -30,7 +30,7 @@ from schwab.analytics import (
     premium_summary,
     transaction_frame,
 )
-from schwab.charts import build_charts
+from schwab.charts import build_charts, gain_breakdown_chart, interim_breakdown_chart
 from schwab.domain import DEFAULT_RISK_FREE, fmt_ratio
 from schwab.report import build_report
 from schwab.statements import StatementParser
@@ -311,6 +311,7 @@ if not metrics["annualization_valid"]:
 charts = dict(build_charts(frame, holdings, metrics))
 
 confirm_trades, quote_marks, confirm_error = read_confirms()
+interim = positions_module.interim_performance(records, confirm_trades, marks=quote_marks)
 
 (
     tab_overview,
@@ -337,6 +338,37 @@ confirm_trades, quote_marks, confirm_error = read_confirms()
 )
 
 with tab_overview:
+    if interim["anchor_date"] is not None:
+        st.subheader("Current month")
+        estimate = st.columns(2)
+        estimate[0].metric(
+            f"Statement ending value ({interim['anchor_date']})",
+            money(interim["anchor_account_value"]),
+        )
+        current_value = (
+            interim["anchor_account_value"] + interim["pnl"]
+            if interim["pnl"] is not None
+            else None
+        )
+        estimate[1].metric(
+            "Estimated value today (unaudited)",
+            money(current_value) if current_value is not None else "n/a (incomplete)",
+            delta=money(interim["pnl"]) if interim["pnl"] is not None else None,
+            help=(
+                f"Statement ending value on {interim['anchor_date']}, plus confirmed "
+                "trade cash since then, plus today's delayed quote marks on open "
+                "positions. Excludes dividends, interest, fees and any corporate "
+                "action since the statement, because confirmations carry none of "
+                "those - it is not a return and is never part of the time-weighted "
+                "series below."
+            ),
+        )
+        for note in interim["assumptions"]:
+            st.warning(note)
+        st.caption(
+            "Unaudited estimate, rolled forward from the last statement using the "
+            "confirmation feed. See the Performance tab for the confirm-feed detail."
+        )
     st.subheader("Account value")
     st.plotly_chart(charts["01_account_value"], use_container_width=True)
     st.subheader("How the value changed")
@@ -347,8 +379,24 @@ with tab_overview:
     )
 
 with tab_performance:
+    st.subheader("Gain breakdown")
+    available_months = sorted(frame["month"].unique(), reverse=True)
+    chosen_month = st.selectbox("Month", available_months, index=0)
+    month_row = frame[frame["month"] == chosen_month].iloc[0]
+    st.plotly_chart(gain_breakdown_chart(month_row), use_container_width=True)
+    residual = month_row.get("reconciliation_residual")
+    if residual is not None and not pd.isna(residual) and abs(residual) >= 0.02:
+        st.caption(
+            f"${abs(residual):,.2f} residual against the statement's printed "
+            "components for this month - investigate rather than ignore."
+        )
+    else:
+        st.caption(
+            "Bars tie to the statement's printed Market Appreciation, Income and "
+            "Expenses lines for this month."
+        )
+
     st.subheader("Since the last statement (confirmation feed)")
-    interim = positions_module.interim_performance(records, confirm_trades, marks=quote_marks)
     if interim["anchor_date"] is None:
         st.info("No statement is stored, so there is nothing to roll forward from.")
     elif interim["trade_count"] == 0:
@@ -368,6 +416,7 @@ with tab_performance:
             delta=(f"{interim['pnl_pct'] * 100:.2f}% of last account value"
                    if interim["pnl_pct"] is not None else None),
         )
+        st.plotly_chart(interim_breakdown_chart(interim), use_container_width=True)
         st.caption(
             f"Window {interim['anchor_date']} to today. Position-level profit and loss only, "
             "marked at delayed third-party quotes. This is **not** a time-weighted return and "

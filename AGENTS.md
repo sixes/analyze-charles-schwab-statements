@@ -23,10 +23,12 @@ which are the printed record everything else is audited against.
   - `analytics.py` — Modified Dietz, IRR, frames, metrics, attribution, premium.
   - `positions.py` — statement-anchored rollforward.
   - `reconcile.py` — statement rows versus the confirm feed.
+  - `monitor.py` — price-band alerts on the current position book, wired for cron.
   - `quotes.py` — the only module that touches the market.
   - `charts.py` — Plotly figures. `report.py` — plain-text report. `notify.py` — SMTP.
   - `store.py` — Postgres persistence. Pure I/O, no analytics.
-  - `cli.py` / `__main__.py` — `analyze|ingest|positions|quotes|reconcile|initdb|inventory`.
+  - `cli.py` / `__main__.py` —
+    `analyze|ingest|monitor|positions|quotes|reconcile|initdb|inventory`.
 - `app.py` — Streamlit web UI. It imports the package directly and must never reimplement
   parsing or analytics.
 - `run.sh` — process control and the cron entry point. It sources `.env` so `DATABASE_URL`,
@@ -50,18 +52,21 @@ python3 -m schwab analyze --dir path --out path --rf 0.03
 python3 -m schwab analyze --verbose          # show unparsed statement lines
 python3 -m schwab analyze --save-db          # also persist each statement
 python3 -m schwab ingest [--days 7] [--dry-run] [--reprocess] [--no-notify]
+python3 -m schwab monitor [--dry-run] [--no-notify]
 python3 -m schwab positions | quotes | reconcile
 
 # Web UI on port 9388, password from .env
 ./run.sh initdb          # create the database and schema once
 ./run.sh start|restart|stop|status|logs
-./run.sh inventory       # what is stored
+./run.sh inventory       # what is stored, and which price bands have been reported
 ./run.sh ingest          # pull new confirmations, under flock
-./run.sh cron-install    # print the crontab line (never installs it silently)
+./run.sh monitor         # alert on positions past a price band, under flock
+./run.sh cron-install    # print the crontab lines (never installs them silently)
 ```
 
-The every-five-minute entry is already installed in the user's crontab; `cron-install`
-prints it for reinstalling or checking against what is live.
+Two schedules are installed in the user's crontab: `ingest` every five minutes, and
+`monitor` every ten minutes through the US session. `cron-install` prints both for
+reinstalling or checking against what is live.
 
 ## Two feeds, one direction of trust
 
@@ -122,6 +127,13 @@ cascade` and a statement's child rows are deleted and reinserted on every re-par
 trade stored under that lifecycle would vanish when its PDF was re-uploaded. Email bodies
 are never stored — they carry the account tail and the address — and IMAP stays the
 archive.
+
+`alerts` is the monitor's memory of which price bands it has already mailed, unique on
+`(position_key, direction, band)`. That key carries **no date on purpose**: a band is news
+once for the life of a position, not once a day. Adding a date would mail every holding
+that sits past a band at the first tick of every session, which is the surest way to train
+the reader to ignore the alert. `entry_price` is stored beside it because it is the
+reference the move was measured against — see the monitor section for why that matters.
 
 A `settings` key/value table holds the assumptions the UI can change, currently only
 `risk_free`. It defaults to `domain.DEFAULT_RISK_FREE` (3%), the app writes it back when
@@ -333,6 +345,73 @@ stylesheets, and every interpolated value is escaped — it all comes from email
 read on a phone by a person, so keep it that way. A notification failure is
 logged and never masks the ingestion result, and ingest exits non-zero on failure so cron's
 own mail is a backstop if SMTP is what broke.
+
+## Price-band alerts
+
+`monitor.py` mails a position when its price reaches a band it has not reported before.
+`./run.sh monitor` is meant for cron every ten minutes through the US session and runs
+under its **own** `flock`, separate from ingest's: the two passes are independent, and
+because `flock -n` is non-blocking a slow quote round trip would otherwise make an ingest
+tick skip rather than wait.
+
+The measure is a **price** move from the price the position was traded at,
+`(mark - entry) / entry`, where `entry` is `positions.rollforward`'s `entry_price` — cost
+basis over quantity times the multiplier. It is not a return and not a statement figure,
+because it is measured against a delayed third-party mark.
+
+Direction is therefore not the same thing as profit, and this is the trap the whole module
+is arranged around: **a short option gains when its price falls**. A short put whose
+premium drops 80% is an $878 gain; one whose premium doubles is a loss. `evaluate()`
+records `adverse` — whether the move went against the position — and both renderings key
+their colour and their wording to that, never to the sign of the percentage. A red `-80%`
+on a short put would tell the reader precisely the opposite of what happened. The two
+figures cannot drift apart, because `unrealized` is `quantity x multiplier x
+(price - entry)` and so always agrees in sign with `adverse`.
+
+Bands are 10% for shares and ETFs and 50% for options — premium is leveraged, and a 10%
+band on a contract would fire on noise. They are multiples, so a position keeps reporting
+as it climbs: 10%, then 20%, then 30%. `band_for` **truncates** rather than rounds, so the
+number in the mail is a floor the move has actually passed; +19% reports the 10% band.
+
+A band is reported **once for the life of the position**, not once a day. The alerts table
+does the deduplication with a unique key and `on conflict do nothing`, so the insert *is*
+the claim and two overlapping ticks cannot both take one band. Most ticks therefore send
+nothing, which is the same discipline that keeps ingest silent on a tick that finds nothing
+new: a book with several long-held winners in it would otherwise mail the same nine rows
+every morning until they were ignored.
+
+Two consequences that need to keep working:
+
+- **The mail must not be lost.** A band recorded as reported but never delivered would be
+  silent for the life of the position, so a failed send releases the claim with
+  `store.drop_alerts` and the next tick reports it again.
+- **A rebased position must re-alert.** Adding to a holding or reopening a closed one moves
+  the entry price, and bands recorded against the old basis describe a different position.
+  `store.clear_rebased_alerts` drops them when the stored `entry_price` no longer matches
+  within a cent, so the move is reported afresh against the new basis.
+
+Nothing is skipped silently. A position past expiry, with no recorded basis or with no
+mark cannot be measured, and it is listed as unevaluated in the log and in the mail rather
+than dropped — a monitor that quietly stops watching a leg is worse than one that says it
+cannot. Expired options are excluded specifically because `rollforward` prices them at zero
+on an assumption, so a `-100%` there would be an artefact of that assumption and not a
+move. If every quote fails the pass says so and stays silent, because that is a network
+problem rather than news about the account.
+
+Quotes are fetched fresh rather than read from the cache — a ten-minute tick exists to see
+the move — and the pass writes them back with `save_quotes`, so the web UI and the report
+stay current as a side effect.
+
+The cron window is `21:30`–`04:00` local, which is one US session and **crosses midnight**:
+the evening half is Mon–Fri and the morning half is Tue–Sat, which is the same five
+sessions. Those hours are written for daylight saving time; when New York moves to EST the
+session is `22:30`–`05:00` local and the entries need shifting by one hour. No market
+calendar is consulted, and none is needed: on a holiday the marks do not move, so no new
+band is reached and the pass stays silent on its own.
+
+`--dry-run` reports what would be mailed and writes nothing. `--no-notify` is not the same
+thing — it records the bands as reported *without* mailing them, which is how a book that is
+already past several bands is seeded into silence.
 
 ## Privacy
 
