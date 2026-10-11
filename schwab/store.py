@@ -20,6 +20,7 @@ import math
 import os
 import re
 from datetime import date, datetime
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, localcontext
 from urllib.parse import urlsplit, urlunsplit
 
 import psycopg
@@ -333,6 +334,21 @@ def ensure_schema(conn: psycopg.Connection) -> None:
                 session_date date,
                 created_at timestamptz not null default now(),
                 unique (position_key, direction, band)
+            )
+            """
+        )
+        # Roll candidates have their own lifetime identity and per-position cooldown;
+        # neither their claims nor their cleanup may change the price-band memory.
+        cur.execute(
+            f"""
+            create table if not exists {SCHEMA}.roll_alerts (
+                id bigserial primary key,
+                position_key text not null,
+                candidate_key text not null,
+                reference_basis numeric(20,4) not null,
+                quantity numeric(20,4) not null,
+                created_at timestamptz not null default now(),
+                unique (position_key, candidate_key, reference_basis, quantity)
             )
             """
         )
@@ -965,6 +981,160 @@ def alert_index(conn: psycopg.Connection, limit: int = 50) -> list[dict]:
         )
         columns = [description.name for description in cur.description]
         return [dict(zip(columns, row)) for row in cur.fetchall()]
+
+
+# --------------------------------------------------------------------------
+# roll alerts
+# --------------------------------------------------------------------------
+def _roll_numeric(value, *, integral: bool = False) -> Decimal | None:
+    """Normalize like numeric(20,4), including PostgreSQL's ties-away rounding."""
+    try:
+        number = Decimal(str(value))
+        if not number.is_finite():
+            return None
+        if integral and (not number or number != number.to_integral_value()):
+            return None
+        with localcontext() as context:
+            context.prec = 24
+            number = number.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+        return number if number.copy_abs() < Decimal("1e16") else None
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+
+
+def _roll_identity(alert: dict) -> tuple:
+    basis = _roll_numeric(alert.get("reference_basis"))
+    quantity = _roll_numeric(alert.get("quantity"), integral=True)
+    key, candidate = alert.get("key"), alert.get("candidate_key")
+    if (not isinstance(key, str) or not key
+            or not isinstance(candidate, str) or not candidate
+            or basis is None or quantity is None):
+        raise ValueError("Roll alerts need keys, a finite basis and a signed integral quantity")
+    return key, candidate, basis, quantity
+
+
+def _lock_roll_positions(cur, keys) -> None:
+    # Stable lock keys and ordering prevent races and deadlocks between candidates.
+    for key in sorted(set(keys)):
+        digest = hashlib.sha256(f"{SCHEMA}.roll_alerts:{key}".encode()).digest()
+        lock_id = int.from_bytes(digest[:8], "big", signed=True)
+        cur.execute("select pg_advisory_xact_lock(%s::bigint)", (lock_id,))
+
+
+def cleanup_roll_alerts(conn: psycopg.Connection, book: list[dict]) -> None:
+    """Clean from the full book, preserving uncertain positions and recent rebase cooldowns."""
+    positions = {row["key"]: row for row in book}
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute(f"select distinct position_key from {SCHEMA}.roll_alerts")
+            keys = [row[0] for row in cur.fetchall()]
+            _lock_roll_positions(cur, keys)
+            for key in keys:
+                position = positions.get(key)
+                if position is None or position.get("status") == "assumed_expired_worthless":
+                    cur.execute(
+                        f"delete from {SCHEMA}.roll_alerts where position_key = %s",
+                        (key,),
+                    )
+                    continue
+                if (position.get("status") != "open" or not position.get("is_option")
+                        or as_date(position.get("expiry")) is None):
+                    continue
+                basis = _roll_numeric(position.get("cost_basis"))
+                quantity = _roll_numeric(position.get("quantity"), integral=True)
+                if basis is None or quantity is None:
+                    continue
+                cur.execute(
+                    f"""
+                    delete from {SCHEMA}.roll_alerts
+                     where position_key = %s
+                       and (reference_basis <> %s or quantity <> %s)
+                       and created_at <= statement_timestamp() - interval '24 hours'
+                    """,
+                    (key, basis, quantity),
+                )
+    conn.commit()
+
+
+def roll_alert_states(conn: psycopg.Connection, alerts: list[dict]) -> list[str]:
+    """Read-only previews; missing tables mean no history, not permission to initialize."""
+    identities = [_roll_identity(alert) for alert in alerts]
+    if not identities:
+        return []
+    states = []
+    with conn.cursor() as cur:
+        cur.execute("select to_regclass(%s)", (f"{SCHEMA}.roll_alerts",))
+        if cur.fetchone()[0] is None:
+            return ["would send"] * len(identities)
+        for identity in identities:
+            cur.execute(
+                f"""
+                select case
+                    when exists (
+                        select 1 from {SCHEMA}.roll_alerts
+                         where position_key = %s and candidate_key = %s
+                           and reference_basis = %s and quantity = %s
+                    ) then 'already reported'
+                    when exists (
+                        select 1 from {SCHEMA}.roll_alerts
+                         where position_key = %s
+                           and created_at > statement_timestamp() - interval '24 hours'
+                    ) then 'cooldown'
+                    else 'would send'
+                end
+                """,
+                (*identity, identity[0]),
+            )
+            states.append(cur.fetchone()[0])
+    return states
+
+
+def claim_roll_alerts(conn: psycopg.Connection, alerts: list[dict]) -> list[dict]:
+    """Claim under READ COMMITTED position locks, committing before SMTP."""
+    identities = [_roll_identity(alert) for alert in alerts]
+    if not identities:
+        return []
+    claimed = []
+    with conn.transaction():
+        with conn.cursor() as cur:
+            _lock_roll_positions(cur, [identity[0] for identity in identities])
+            for alert, identity in zip(alerts, identities):
+                # Statement time prevents prior reads or lock waits from backdating cooldowns.
+                cur.execute(
+                    f"""
+                    insert into {SCHEMA}.roll_alerts
+                        (position_key, candidate_key, reference_basis, quantity, created_at)
+                    select %s, %s, %s, %s, statement_timestamp()
+                     where not exists (
+                        select 1 from {SCHEMA}.roll_alerts
+                         where position_key = %s
+                           and ((candidate_key = %s and reference_basis = %s and quantity = %s)
+                                or created_at > statement_timestamp() - interval '24 hours')
+                     )
+                    on conflict (position_key, candidate_key, reference_basis, quantity)
+                        do nothing
+                    returning id
+                    """,
+                    (*identity, *identity),
+                )
+                row = cur.fetchone()
+                if row is not None:
+                    claimed.append({**alert, "claim_id": row[0]})
+    conn.commit()
+    return claimed
+
+
+def drop_roll_alerts(conn: psycopg.Connection, alerts: list[dict]) -> None:
+    """Release only these exact claims after a failed send, never a later claim."""
+    ids = [(alert["claim_id"],) for alert in alerts]
+    if not ids:
+        return
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.executemany(
+                f"delete from {SCHEMA}.roll_alerts where id = %s", ids,
+            )
+    conn.commit()
 
 
 # --------------------------------------------------------------------------

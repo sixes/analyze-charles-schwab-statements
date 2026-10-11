@@ -4,7 +4,7 @@ Subjects are short on purpose: a phone lock-screen push truncates hard, and the 
 of these messages is to say what happened without opening them. Detail goes in the body.
 
 The mail is multipart/alternative. The HTML part puts the trades in a table, which is
-what a phone actually renders; the plain-text part is the same information as prose and
+what a phone actually renders; the plain-text part carries the same comparison rows and
 is what a preview pane and any client without HTML falls back to, so both parts have to
 carry the whole story rather than one being a stub.
 
@@ -17,8 +17,11 @@ from __future__ import annotations
 import logging
 import os
 import smtplib
+from datetime import date, datetime
+from decimal import Decimal
 from email.message import EmailMessage
 from html import escape
+from math import isfinite
 
 from .domain import NETWORK_ATTEMPTS, fmt_money, fmt_qty, retry
 
@@ -167,17 +170,20 @@ def body_for(outcome: dict) -> str:
     dates = sorted({trade["trade_date"] for trade in trades if trade.get("trade_date")})
     when = ""
     if len(dates) == 1:
-        when = f" from {dates[0]:%d %b %Y}"
+        when = f" from {_roll_date(dates[0])}"
     elif dates:
-        when = f" from {dates[0]:%d %b} to {dates[-1]:%d %b %Y}"
+        when = f" from {_roll_date(dates[0])} to {_roll_date(dates[-1])}"
     count = len(trades)
     lines.append(f"{count} trade{'' if count == 1 else 's'}{when} "
                  f"{'was' if count == 1 else 'were'} added to the ledger.")
     lines.append("")
     for trade in trades:
-        lines.append(f"  {describe(trade)}")
+        rows, _ = _econfirm_rows(trade)
+        lines.extend([_roll_text_table(ECONFIRM_COLUMNS, rows), ""])
     if trades:
-        lines.append("")
+        if any(trade.get("intent") not in ("open", "close") for trade in trades):
+            lines.append(f"* {UNKNOWN_INTENT_NOTE}.")
+        lines.extend([ECONFIRM_NOTE, ""])
     net = outcome.get("net_amount")
     kind = "" if net is None else f" ({'credit' if net >= 0 else 'debit'})"
     lines.append(f"Cash from these trades: {signed(net)}{kind}")
@@ -251,38 +257,57 @@ def _cell(content: str, align: str = "left", color: str | None = None) -> str:
     return f'<td align="{align}" style="{style}">{content}</td>'
 
 
+ECONFIRM_COLUMNS = ("Contract", "Size", "Close / Open", "Price ($/share)",
+                    "Cash ($)", "Trade date", "Expiry")
+ECONFIRM_NOTE = (
+    "Original is historical context reconstructed from available confirmations; its full "
+    "size and cash may differ from Current. Totals count Current rows only. "
+    "Dates: MM-DD-YY; - = not applicable; n/a = unavailable."
+)
+
+
+def _econfirm_rows(trade: dict) -> tuple[list[tuple[str, ...]], dict]:
+    context = trade.get("original_context") or {}
+    original = context.get("original") if context.get("status") == "verified" else None
+    rows, colors = [], {}
+    for index, (label, fill) in enumerate((("Original", original), ("Current", trade))):
+        if fill is None:
+            absent = context.get("status") == "none"
+            marker = "-" if absent else "n/a"
+            reason = "No prior position" if absent else context.get("reason") or "Original history unavailable"
+            rows.append((f"{label} · {_econfirm_contract(trade)}\n{reason}", *(marker,) * 6))
+            continue
+        price = fill.get("price")
+        net = fill.get("net_amount")
+        price = price if price is not None and isfinite(price) else None
+        net = net if net is not None and isfinite(net) else None
+        intent = fill.get("intent")
+        action = _verb(fill) + (" *" if intent not in ("open", "close") else "")
+        rows.append((
+            f"{label} · {_econfirm_contract(fill)}", _count(fill), action,
+            f"{price:,.2f}" if price is not None else "n/a", signed(net),
+            _roll_date(fill.get("trade_date")),
+            _roll_date(fill.get("expiry")) if fill.get("is_option") else "-",
+        ))
+        colors[index, 2] = ROLL_OPEN_COLOR if intent == "open" else ROLL_CLOSE_COLOR if intent == "close" else MUTED_COLOR
+        colors[index, 4] = _cash_color(net)
+    return rows, colors
+
+
+def _econfirm_contract(trade: dict) -> str:
+    if not trade.get("is_option") or trade.get("strike") is None:
+        return _contract(trade)
+    strike = Decimal(str(trade["strike"]))
+    digits = max(2, -strike.as_tuple().exponent)
+    return f"{trade.get('symbol') or '?'} ${strike:,.{digits}f} {str(trade.get('option_type') or 'option').lower()}"
+
+
 def _trade_table(trades: list[dict]) -> str:
-    columns = (("Action", "left"), ("Contract", "left"), ("Expiry", "left"),
-               ("Qty", "right"), ("Price", "right"), ("Cash", "right"))
-    head = "".join(
-        f'<th align="{align}" style="padding:0 10px 6px;border-bottom:2px solid #999;'
-        f'font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;'
-        f'color:{MUTED_COLOR};white-space:nowrap;">{escape(label)}</th>'
-        for label, align in columns
-    )
-
-    rows = []
+    tables = []
     for trade in trades:
-        net = trade.get("net_amount")
-        price = trade.get("price")
-        expiry = trade.get("expiry")
-        action = escape(_verb(trade))
-        if trade.get("intent") not in ("open", "close"):
-            action += f' <span style="color:{MUTED_COLOR};">*</span>'
-        rows.append(
-            "<tr>"
-            + _cell(action)
-            + _cell(escape(_contract(trade)))
-            + _cell(f"{expiry:%d %b %Y}" if expiry is not None else "&mdash;")
-            + _cell(escape(_count(trade)), align="right")
-            + _cell(escape(fmt_money(price)) if price is not None else "n/a", align="right")
-            + _cell(escape(signed(net)), align="right", color=_cash_color(net))
-            + "</tr>"
-        )
-
-    return ('<table cellpadding="0" cellspacing="0" border="0" role="presentation" '
-            'style="border-collapse:collapse;width:100%;font-size:14px;">'
-            f"<thead><tr>{head}</tr></thead><tbody>{''.join(rows)}</tbody></table>")
+        rows, colors = _econfirm_rows(trade)
+        tables.append(_roll_html_table(ECONFIRM_COLUMNS, rows, comparison=True, cell_colors=colors))
+    return '<div style="height:14px;"></div>'.join(tables)
 
 
 def _stat_table(pairs: list[tuple[str, str]]) -> str:
@@ -295,8 +320,8 @@ def _stat_table(pairs: list[tuple[str, str]]) -> str:
             f'style="border-collapse:collapse;font-size:14px;">{rows}</table>')
 
 
-def _page(blocks: list[str]) -> str:
-    return ('<html><body style="margin:0;padding:18px;background:#ffffff;color:#1a1a1a;'
+def _page(blocks: list[str], head: str = "") -> str:
+    return (f'<html>{head}<body style="margin:0;padding:18px;background:#ffffff;color:#1a1a1a;'
             'font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',Helvetica,Arial,'
             'sans-serif;font-size:15px;">'
             f"{''.join(blocks)}</body></html>")
@@ -325,9 +350,9 @@ def html_for(outcome: dict) -> str:
     dates = sorted({trade["trade_date"] for trade in trades if trade.get("trade_date")})
     when = ""
     if len(dates) == 1:
-        when = f" from {dates[0]:%d %b %Y}"
+        when = f" from {_roll_date(dates[0])}"
     elif dates:
-        when = f" from {dates[0]:%d %b} to {dates[-1]:%d %b %Y}"
+        when = f" from {_roll_date(dates[0])} to {_roll_date(dates[-1])}"
     count = len(trades)
     blocks = [_paragraph(
         f"<strong>{count} trade{'' if count == 1 else 's'}</strong>{escape(when)} "
@@ -337,6 +362,7 @@ def html_for(outcome: dict) -> str:
         blocks.append(_trade_table(trades))
         if any(trade.get("intent") not in ("open", "close") for trade in trades):
             blocks.append(_paragraph(f"* {escape(UNKNOWN_INTENT_NOTE)}.", color=MUTED_COLOR))
+        blocks.append(_paragraph(escape(ECONFIRM_NOTE), color=MUTED_COLOR))
 
     net = outcome.get("net_amount")
     blocks.append(_heading("Cash from these trades"))
@@ -379,7 +405,8 @@ def html_for(outcome: dict) -> str:
         "Positions and prices here come from the confirmation emails. Those carry no cash "
         "balance, dividend or expiration information, so account value, return and risk "
         "figures still come from the monthly statement.", color=MUTED_COLOR))
-    return _page(blocks)
+    return _page(['<div style="max-width:980px;margin:0 auto;overflow-wrap:anywhere;">',
+                  *blocks, '</div>'], head=_comparison_head())
 
 
 def announce(outcome: dict) -> bool:
@@ -547,3 +574,225 @@ def announce_alerts(alerts: list, unevaluated=None) -> bool:
     if subject is None:
         return False
     return send(subject, alert_body(alerts, unevaluated), alert_html(alerts, unevaluated))
+
+
+ROLL_COLUMNS = ("Contract", "Size", "Close / Open", "Cost ($/share)",
+                "Current ($/share)", "Trade date", "Expiry")
+ROLL_CLOSE_COLOR = "#925900"
+ROLL_OPEN_COLOR = "#175ca4"
+ROLL_NOTES = (
+    "Cost/share: original = recorded basis reference, not a fill; new = estimated entry. "
+    "Dates: MM-DD-YY; n/a = unverified opening history; - = not traded.",
+    "Screen: same underlying/size, same or lower strike, later expiry within 70 calendar DTE; "
+    "spread ≤50% of midpoint. No open-interest or last-trade filter.",
+    "Coverage: first 4 eligible expiries; ≤500 weighted attempts/pass and rolling minute "
+    "(metadata, depth, retries). Not exhaustive.",
+    "Quotes: retrieval times only, no exchange quote timestamp; may be stale/asynchronous. "
+    "Standard metadata: 100-share multiplier and size. Verify deliverables, full-size fills "
+    "and buying power manually.",
+    "Indicative, not executable offers. Net credit is not profit or realized P&L. "
+    "Actual fees/fills may differ. Manual review; no orders placed.",
+)
+
+
+def _roll_intro(alerts: list) -> str:
+    return f"{len(alerts)} roll candidate{'' if len(alerts) == 1 else 's'} · manual review"
+
+
+def _roll_date(value) -> str:
+    if isinstance(value, datetime):
+        return value.strftime("%m-%d-%y %H:%M:%S %Z").strip()
+    if isinstance(value, date):
+        return value.strftime("%m-%d-%y")
+    return str(value) if value is not None else "n/a"
+
+
+def _roll_rows(alert: dict) -> list[tuple[str, ...]]:
+    count = abs(alert["quantity"])
+    basis = abs(Decimal(str(alert["reference_basis"])))
+    basis /= Decimal(str(count)) * Decimal(str(alert["current"]["multiplier"]))
+    dates = alert.get("original_trade_dates")
+    original_date = ", ".join(_roll_date(value) for value in dates) if dates else "n/a"
+    put = alert["option_type"] == "PUT"
+    rows = []
+    for label, key, leg, price_side, cost, trade_date in (
+        ("Original", "current", "close", "ask" if put else "bid", basis, original_date),
+        ("New", "candidate", "open", "bid" if put else "ask", alert["open_price"], "-"),
+    ):
+        quote = alert[key]
+        strike = Decimal(str(quote["strike"]))
+        strike_label = f"${strike:,.{max(2, -strike.as_tuple().exponent)}f}"
+        rows.append((
+            f"{label} · {quote['symbol']} {strike_label} {quote['option_type'].lower()}",
+            fmt_qty(count), f"{alert[f'{leg}_action']}\n{price_side}", f"{cost:,.2f}",
+            f"{alert[f'{leg}_price']:,.2f}\nBid {fmt_money(quote['bid'])} / Ask {fmt_money(quote['ask'])}",
+            trade_date, _roll_date(quote["expiry"]),
+        ))
+    return rows
+
+
+def _roll_summary(alert: dict) -> tuple[str, str]:
+    gap = alert["open_price"] - alert["close_price"]
+    if alert["option_type"] == "CALL":
+        gap = -gap
+    count = abs(alert["quantity"])
+    total = alert["net_credit_total"]
+    return (
+        f"Gap {signed(gap)}/share · Net {_cash(total)} · +{alert['added_days']} days",
+        f"Close {_cash(alert['close_cash_per_contract'] * count)} → "
+        f"open {_cash(alert['open_cash_per_contract'] * count)} − fees {fmt_money(alert['fees_total'])}; "
+        f"net {_cash(alert['net_credit_per_contract'])}/contract; {alert['dte']} DTE. "
+        "Gap before fees; net after fees.",
+    )
+
+
+def _roll_quote_rows(alerts: list) -> list[tuple[str, ...]]:
+    rows = []
+    for index, alert in enumerate(alerts, 1):
+        details = []
+        for label, key in (("Original", "current"), ("New", "candidate")):
+            quote = alert[key]
+            details.append(f"{label}: {_roll_date(quote.get('fetched_at'))} · "
+                           f"{quote.get('source') or 'Longbridge OPRA'}")
+        rows.append((f"{index}. {alert['symbol']}", "\n".join(details),
+                     f"{alert['current_spread']:.2%} / {alert['candidate_spread']:.2%}"))
+    return rows
+
+
+def _roll_notes(alerts: list) -> list[str]:
+    notes = list(ROLL_NOTES)
+    fees = ", ".join(fmt_money(fee) for fee in sorted({alert["fee_per_leg"] for alert in alerts}))
+    notes.append(f"Fee allowance: {fees}/contract/leg; both legs included above.")
+    if any(alert["option_type"] == "PUT" for alert in alerts):
+        notes.append("Short puts: longer assignment/downside exposure.")
+    if any(alert["option_type"] == "CALL" for alert in alerts):
+        notes.append("No-cash long calls: unusual quotes; verify both legs.")
+    return notes
+
+
+def _roll_text_table(columns, rows) -> str:
+    flattened = [columns, *(tuple(cell.replace("\n", "; ") for cell in row) for row in rows)]
+    widths = [max(len(row[index]) for row in flattened) for index in range(len(columns))]
+    lines = [" | ".join(cell.ljust(width) for cell, width in zip(row, widths)).rstrip()
+             for row in flattened]
+    lines.insert(1, "-+-".join("-" * width for width in widths))
+    return "\n".join(lines)
+
+
+def _roll_html_table(columns, rows, comparison=False, cell_colors=None) -> str:
+    headers = "".join(f'<th scope="col" style="padding:8px 6px;text-align:left;'
+                      f'font-size:11px;color:{MUTED_COLOR};border-bottom:{RULE};">'
+                      f'{escape(label)}</th>' for label in columns)
+    rendered = []
+    for row_index, row in enumerate(rows):
+        cells = []
+        for index, (label, value) in enumerate(zip(columns, row)):
+            lines = value.split("\n")
+            content = escape(lines[0])
+            style = f"padding:9px 6px;vertical-align:top;border-bottom:{RULE};"
+            if comparison:
+                if index in (5, 6):
+                    content = ", ".join(
+                        f'<span style="white-space:nowrap;">{escape(part)}</span>'
+                        if len(part) == 8 and part[2] == part[5] == "-" and part.replace("-", "").isdigit()
+                        else escape(part) for part in lines[0].split(", "))
+                if index in (1, 3, 4):
+                    style += "text-align:right;font-variant-numeric:tabular-nums;"
+                if index in (0, 2, 4):
+                    content = f"<strong>{content}</strong>"
+                if index == 2 and cell_colors is None:
+                    style += f"color:{ROLL_CLOSE_COLOR if row_index == 0 else ROLL_OPEN_COLOR};"
+            if cell_colors and (row_index, index) in cell_colors:
+                style += f"color:{cell_colors[row_index, index]};"
+            if len(lines) > 1:
+                content += (f'<br><span style="font-size:11px;color:{MUTED_COLOR};">'
+                            + "<br>".join(escape(line) for line in lines[1:]) + "</span>")
+            cells.append(f'<td data-label="{escape(label, quote=True)}" style="{style}">{content}</td>')
+        rendered.append("<tr>" + "".join(cells) + "</tr>")
+    name = "roll-comparison" if comparison else "roll-details"
+    widths = (26, 5, 15, 11, 18, 13, 12) if comparison else (20, 60, 20) if len(columns) == 3 else ()
+    cols = '<colgroup>' + ''.join(f'<col style="width:{width}%;">' for width in widths) + '</colgroup>'
+    layout = "table-layout:fixed;" if widths else ""
+    return (f'<table class="{name}" cellpadding="0" cellspacing="0" '
+            f'style="{layout}border-collapse:collapse;width:100%;font-size:13px;overflow-wrap:anywhere;">'
+            f'{cols if widths else ""}<thead><tr>{headers}</tr></thead>'
+            f'<tbody>{"".join(rendered)}</tbody></table>')
+
+
+def roll_subject(alerts: list) -> str | None:
+    if not alerts:
+        return None
+    return f"Schwab: {len(alerts)} roll candidate{'' if len(alerts) == 1 else 's'} to review"
+
+
+def roll_body(alerts: list, unevaluated=None) -> str:
+    if not alerts:
+        return ""
+    lines = [_roll_intro(alerts)]
+    for index, alert in enumerate(alerts, 1):
+        lines.extend(["", f"{index}. {alert['symbol']}",
+                      _roll_text_table(ROLL_COLUMNS, _roll_rows(alert)), *_roll_summary(alert)])
+    lines.extend(["", "Quote details", _roll_text_table(
+        ("Position", "Depth retrieved / source", "Spread: original / new"), _roll_quote_rows(alerts))])
+    if unevaluated:
+        rows = [(line,) for line in dict.fromkeys(map(str, unevaluated))]
+        lines.extend(["", _roll_text_table(("Coverage / skipped",), rows)])
+    lines.extend(["", "Notes", *_roll_notes(alerts)])
+    return "\n".join(lines)
+
+
+def _comparison_head() -> str:
+    return """<head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+@media (max-width:600px) {
+  .roll-comparison thead, .roll-comparison colgroup { display:none; }
+  .roll-comparison, .roll-comparison tbody { display:block; }
+  .roll-comparison tr { display:grid; grid-template-columns:repeat(2,minmax(0,1fr));
+    border-bottom:2px solid #ddd; }
+  .roll-comparison td { display:block; text-align:left !important; }
+  .roll-comparison td:first-child { grid-column:1 / -1; background:#f6f8fa; }
+  .roll-comparison td::before { content:attr(data-label); display:block;
+    font-size:10px; color:#5c5c5c; margin-bottom:3px; }
+  .roll-comparison td:first-child::before { display:none; }
+  .roll-details { font-size:11px !important; }
+  .roll-details col { width:25% !important; }
+  .roll-details col:nth-child(2) { width:50% !important; }
+}
+</style></head>"""
+
+
+def roll_html(alerts: list, unevaluated=None) -> str:
+    if not alerts:
+        return ""
+    blocks = [_paragraph(f"<strong>{escape(_roll_intro(alerts))}</strong>")]
+    for index, alert in enumerate(alerts, 1):
+        summary, cash = _roll_summary(alert)
+        gap, net, term = summary.split(" · ")
+        total = alert["net_credit_total"]
+        color = MUTED_COLOR if total == 0 else _cash_color(total)
+        blocks.extend([
+            _heading(f"{index}. {alert['symbol']}"),
+            _roll_html_table(ROLL_COLUMNS, _roll_rows(alert), comparison=True),
+            f'<div style="padding:10px 8px;background:#f6f8fa;border-bottom:{RULE};font-size:14px;">'
+            f'{escape(gap)} · <strong style="color:{color};">{escape(net)}</strong> · '
+            f'<span style="color:{MUTED_COLOR};">{escape(term)}</span></div>',
+            f'<p style="margin:5px 8px 18px;font-size:11px;color:{MUTED_COLOR};line-height:1.5;">'
+            f'{escape(cash)}</p>',
+        ])
+    blocks.extend([_heading("Quote details"), _roll_html_table(
+        ("Position", "Depth retrieved / source", "Spread: original / new"), _roll_quote_rows(alerts))])
+    if unevaluated:
+        rows = [(line,) for line in dict.fromkeys(map(str, unevaluated))]
+        blocks.append(_roll_html_table(("Coverage / skipped",), rows))
+    blocks.extend([_heading("Notes"), f'<div style="font-size:11px;color:{MUTED_COLOR};line-height:1.5;">',
+                   _bullets(_roll_notes(alerts)), '</div>'])
+    return _page(['<div style="max-width:980px;margin:0 auto;overflow-wrap:anywhere;">',
+                  *blocks, '</div>'], head=_comparison_head())
+
+
+def announce_rolls(alerts: list, unevaluated=None) -> bool:
+    subject = roll_subject(alerts)
+    if subject is None:
+        return False
+    return send(subject, roll_body(alerts, unevaluated), roll_html(alerts, unevaluated))

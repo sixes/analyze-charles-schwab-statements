@@ -17,11 +17,12 @@ option past its expiry is dropped as assumed_expired_worthless and carries a war
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timedelta
+from math import isfinite
 
 import pandas as pd
 
-from .domain import OPTION_MULTIPLIER, fmt_money, fmt_qty, is_expiry_day, occ_symbol
+from .domain import OPTION_MULTIPLIER, fmt_money, fmt_qty, is_expiry_day, occ_symbol, position_key
 
 POSITION_COLUMNS = [
     "key", "symbol", "label", "asset_class", "is_option", "option_type", "strike", "expiry",
@@ -179,6 +180,361 @@ def signed_quantity(action: str, quantity) -> float | None:
     if verb.startswith("purchase") or verb.startswith("buy"):
         return magnitude
     return None
+
+
+def opening_trade_dates(records, trades, book) -> dict[str, tuple[date, ...] | None]:
+    """Infer dates only from confirmations reconciled to statement exposure, without lot allocation."""
+    def calendar_date(value):
+        if not isinstance(value, date) or pd.isna(value):
+            return None
+        return value.date() if isinstance(value, datetime) else value
+
+    def finite_quantity(value):
+        try:
+            value = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return value if isfinite(value) else None
+
+    keys = {row["key"] for row in book}
+    if not keys:
+        return {}
+    snapshots = []
+    for record in records or []:
+        end = calendar_date(record.get("period_end"))
+        if end is not None:
+            anchored = anchor_positions(record)
+            quantities = {
+                key: entry["anchor_quantity"] + entry["pending_quantity"]
+                for key, entry in anchored.items()
+            }
+            snapshots.append((end, quantities))
+    snapshots.sort(key=lambda snapshot: snapshot[0])
+
+    by_key = {key: [] for key in keys}
+    rows = trades.to_dict("records") if isinstance(trades, pd.DataFrame) else (trades or [])
+    for trade in rows:
+        key = trade.get("occ_symbol")
+        if key in by_key:
+            by_key[key].append(trade)
+
+    def reconstruct(key, current):
+        current = finite_quantity(current)
+        if current is None or abs(current) < 1e-9:
+            return None
+        flat_date = next((end for end, quantities in reversed(snapshots)
+                          if abs(quantities.get(key, 0.0)) < 1e-9), None)
+        if flat_date is None:
+            # Even an explicit opening cannot prove there was no earlier exposure.
+            return None
+
+        # End-of-day snapshots follow same-day confirmations in their supplied order.
+        events = [(end, True, quantities.get(key, 0.0))
+                  for end, quantities in snapshots if end > flat_date]
+        for trade in by_key[key]:
+            traded = calendar_date(trade.get("trade_date"))
+            if traded is None:
+                # An undated row cannot safely be placed on either side of the anchor.
+                return None
+            if traded > flat_date:
+                events.append((traded, False, trade))
+        events.sort(key=lambda event: (event[0], event[1]))
+
+        quantity = 0.0
+        dates = set()
+        for traded, is_snapshot, item in events:
+            if is_snapshot:
+                expected = finite_quantity(item)
+                if expected is None or abs(quantity - expected) > 1e-9:
+                    return None
+                continue
+            intent = item.get("intent")
+            if not isinstance(intent, str) or intent not in ("open", "close"):
+                return None
+            try:
+                change = signed_quantity(item.get("action"), item.get("quantity"))
+            except (TypeError, ValueError, OverflowError):
+                return None
+            if change is None or not isfinite(change) or abs(change) < 1e-9:
+                return None
+            if intent == "open":
+                if quantity * change < 0:
+                    return None
+                if dates is not None:
+                    dates.add(traded)
+            else:
+                if quantity * change >= 0 or abs(change) > abs(quantity) + 1e-9:
+                    return None
+                if dates is not None and len(dates) > 1:
+                    dates = None
+            quantity += change
+            if abs(quantity) < 1e-9:
+                quantity = 0.0
+                dates = set()
+
+        if abs(quantity - current) > 1e-9 or not dates:
+            return None
+        return tuple(sorted(dates))
+
+    return {row["key"]: reconstruct(row["key"], row.get("quantity")) for row in book}
+
+
+def original_trade_context(records, history, current_trades, email_index=None) -> list[dict]:
+    """Reconstruct one historical opening fill per Current row without allocating lots."""
+    epsilon = 1e-9
+
+    def text(value):
+        return value.strip() if isinstance(value, str) and value.strip() else None
+
+    def calendar_date(value):
+        if not isinstance(value, date) or pd.isna(value):
+            return None
+        return value.date() if isinstance(value, datetime) else value
+
+    def number(value):
+        try:
+            value = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return value if isfinite(value) else None
+
+    def identity(row):
+        digest, seq = text(row.get("body_sha256")), number(row.get("seq"))
+        if not digest or seq is None or seq < 0 or not seq.is_integer():
+            return None
+        return digest, int(seq)
+
+    def instrument(row, end=None, holding=False):
+        symbol = text(row.get("symbol"))
+        if not symbol:
+            return None
+        if holding:
+            kind = text(row.get("asset_class"))
+            option = kind == "Options" or bool(text(row.get("option_type")))
+            if not kind and not option:
+                return None
+        else:
+            flag = row.get("is_option")
+            if flag is None or pd.isna(flag) or flag not in (True, False):
+                return None
+            option = bool(flag)
+            if not option and text(row.get("option_type")):
+                return None
+        expiry = calendar_date(row.get("expiry"))
+        if holding and option and row.get("expiry") is None:
+            expiry = infer_expiry(row.get("label"), end)
+            if expiry is None or not is_expiry_day(expiry):
+                return None
+        if option and (expiry is None or number(row.get("strike")) is None):
+            return None
+        key = position_key(symbol, option, expiry, text(row.get("option_type")),
+                           row.get("strike"))
+        printed = text(row.get("occ_symbol"))
+        return None if printed and printed != key else key
+
+    def relevant(row, key, symbol, row_key):
+        # An unresolved row for this root (or with no root) might be this contract.
+        root = text(row.get("symbol"))
+        return (row_key == key or (row_key is None and
+                (not root or root.upper() == symbol or text(row.get("occ_symbol")) == key)))
+
+    def delta(action, size):
+        size = number(size)
+        verb = (text(action) or "").lower()
+        if size is None or size <= epsilon:
+            return None
+        if verb in ("sale", "sell", "shortsale", "sellshort"):
+            return signed_quantity("Sale", size)
+        if verb in ("purchase", "buy", "covershort", "buytoclose"):
+            return signed_quantity("Purchase", size)
+        return None
+
+    def fill_change(row):
+        intent = text(row.get("intent"))
+        if intent not in ("open", "close"):
+            return None, "Missing or invalid open/close intent"
+        verb = (text(row.get("action")) or "").lower()
+        if ((verb in ("shortsale", "sellshort") and intent != "open") or
+                (verb in ("covershort", "buytoclose") and intent != "close")):
+            return None, "Action conflicts with open/close intent"
+        change = delta(row.get("action"), row.get("quantity"))
+        return change, "Invalid action or quantity" if change is None else ""
+
+    def compatible(quantity, change, intent):
+        if intent == "open":
+            return quantity * change >= 0
+        return quantity * change < 0 and abs(change) <= abs(quantity) + epsilon
+
+    def snapshot(record, key, symbol, end):
+        # Unresolved holdings or skipped pending rows cannot establish flatness.
+        selected = {"period_end": end, "_holdings": [], "_pending": []}
+        for section in ("_holdings", "_pending"):
+            rows = record.get(section)
+            if not isinstance(rows, (list, tuple)):
+                return None
+            for row in rows:
+                holding = section == "_holdings"
+                row_key = instrument(row, end, holding)
+                if not relevant(row, key, symbol, row_key):
+                    continue
+                quantity = number(row.get("quantity"))
+                if row_key is None or quantity is None:
+                    return None
+                # Missing cost/value must not affect quantity-only reconciliation.
+                clean = {field: row.get(field) for field in
+                         ("symbol", "label", "asset_class", "is_option", "option_type",
+                          "strike", "expiry")}
+                clean["quantity"] = quantity
+                if holding:
+                    if clean["expiry"] is None and row.get("asset_class") == "Options":
+                        clean["expiry"] = infer_expiry(row.get("label"), end)
+                else:
+                    change = delta(row.get("category") or row.get("action"), quantity)
+                    if change is None:
+                        return None
+                    clean["action"] = "Sale" if change < 0 else "Purchase"
+                selected[section].append(clean)
+        entry = anchor_positions(selected).get(key)
+        return number(entry["anchor_quantity"] + entry["pending_quantity"]) if entry else 0.0
+
+    def result(status, reason, original=None):
+        return {"status": status, "original": original, "reason": reason}
+
+    historical = history.to_dict("records") if isinstance(history, pd.DataFrame) else list(history or [])
+    current = list(current_trades or [])
+    rows = historical + current
+    indexed_emails = list(email_index or [])
+    dated_records = [(calendar_date(record.get("period_end")), record)
+                     for record in records or []]
+
+    def resolve(target):
+        day = calendar_date(target.get("trade_date"))
+        target_id = identity(target)
+        key = instrument(target)
+        if day is None:
+            return result("unavailable", "Trade date unavailable")
+        if target_id is None:
+            return result("unavailable", "Fill identity unavailable")
+        if key is None:
+            return result("unavailable", "Instrument identity unavailable")
+        change, problem = fill_change(target)
+        if problem:
+            return result("unavailable", problem)
+        symbol = text(target.get("symbol")).upper()
+        if any(end is None for end, _ in dated_records):
+            return result("unavailable", "Statement date unavailable")
+        earlier = [(end, record) for end, record in dated_records if end < day]
+
+        # Conflicting known tails make account-less statements ambiguous across tickers.
+        scoped = [row for row in rows if calendar_date(row.get("trade_date")) is None
+                  or calendar_date(row.get("trade_date")) <= day]
+        for _, record in earlier:
+            scoped.append(record)
+            scoped.extend(record.get("_holdings") or [])
+            scoped.extend(record.get("_pending") or [])
+        tails = {text(row.get("account_tail")) for row in scoped}
+        tails.discard(None)
+        if len(tails) > 1:
+            return result("unavailable", "Conflicting account scope")
+
+        snapshots = {}
+        for end, record in earlier:
+            quantity = snapshot(record, key, symbol, end)
+            if end in snapshots and (quantity is None or snapshots[end] is None or
+                                     abs(snapshots[end] - quantity) > epsilon):
+                snapshots[end] = None
+            else:
+                snapshots[end] = quantity
+        flat = max((end for end, quantity in snapshots.items()
+                    if quantity is not None and abs(quantity) < epsilon), default=None)
+        if flat is None:
+            return result("unavailable", "No earlier flat statement")
+
+        fills = {}
+        for row in rows:
+            row_id = identity(row)
+            if row_id == target_id:
+                continue
+            traded = calendar_date(row.get("trade_date"))
+            if traded is not None and (traded <= flat or traded > day):
+                continue
+            row_key = instrument(row)
+            if not relevant(row, key, symbol, row_key):
+                continue
+            if traded is None:
+                return result("unavailable", "Undated relevant fill")
+            if row_key is None:
+                return result("unavailable", "Unresolved instrument in history")
+            if row_id is None:
+                return result("unavailable", "Historical fill identity unavailable")
+            if traded == day:
+                return result("unavailable", "Other same-instrument fills on trade date")
+            if row_id in fills:
+                # Stored and notification copies share identity, not permission to disagree.
+                previous = fills[row_id]
+                fields = ("action", "intent", "account_tail")
+                amounts = ("quantity", "price", "net_amount")
+                if (calendar_date(previous.get("trade_date")) != traded or
+                        any(text(previous.get(field)) != text(row.get(field)) for field in fields) or
+                        any(number(previous.get(field)) != number(row.get(field)) for field in amounts)):
+                    return result("unavailable", "Conflicting copies of historical fill")
+            else:
+                fills[row_id] = row
+
+        # Unidentified failed blocks may hide same-day fills reported in next-day eConfirms.
+        horizon = day + timedelta(days=1)
+        target_headers = [calendar_date(target.get("confirm_date"))]
+        target_headers.extend(calendar_date(email.get("confirm_date")) for email in indexed_emails
+                              if text(email.get("body_sha256")) == target_id[0])
+        horizon = max([horizon] + [value for value in target_headers if value is not None])
+        digests = {row_id[0] for row_id in fills} | {target_id[0]}
+        for email in indexed_emails:
+            if text(email.get("status")) == "ok" and not text(email.get("error")):
+                continue
+            confirmed = calendar_date(email.get("confirm_date"))
+            if (text(email.get("body_sha256")) in digests or confirmed is None or
+                    flat < confirmed <= horizon):
+                return result("unavailable", "Known incomplete confirmation history")
+
+        events = [(end, True, quantity) for end, quantity in snapshots.items() if end > flat]
+        counts = {}
+        for row in fills.values():
+            traded = calendar_date(row.get("trade_date"))
+            counts[traded] = counts.get(traded, 0) + 1
+            if counts[traded] > 1:
+                return result("unavailable", "Ambiguous same-day historical fills")
+            events.append((traded, False, row))
+        events.sort(key=lambda event: (event[0], event[1]))
+        quantity, openings = 0.0, []
+        for _, is_snapshot, item in events:
+            if is_snapshot:
+                if item is None:
+                    return result("unavailable", "Unresolved statement exposure")
+                if abs(quantity - item) > epsilon:
+                    return result("unavailable", "Statement quantity disagrees with history")
+                continue
+            step, problem = fill_change(item)
+            if problem:
+                return result("unavailable", problem)
+            if not compatible(quantity, step, text(item.get("intent"))):
+                return result("unavailable", "History conflicts with position direction or size")
+            if text(item.get("intent")) == "open":
+                openings.append(item)
+            quantity += step
+            if not isfinite(quantity):
+                return result("unavailable", "Invalid cumulative quantity")
+            if abs(quantity) < epsilon:
+                quantity, openings = 0.0, []
+
+        if not compatible(quantity, change, text(target.get("intent"))):
+            return result("unavailable", "Current conflicts with position direction or size")
+        if not quantity:
+            return result("none", "No prior position")
+        if len(openings) != 1:
+            return result("unavailable", "Multiple opening fills in active position")
+        return result("verified", "Reconstructed from available confirmations", openings[0])
+
+    return [resolve(target) for target in current]
 
 
 def rollforward(records, trades, marks=None, today: date = None) -> pd.DataFrame:

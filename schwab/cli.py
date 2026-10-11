@@ -254,7 +254,25 @@ def cmd_ingest(args) -> int:
 def cmd_monitor(args) -> int:
     from . import monitor
 
-    return monitor.run(dry_run=args.dry_run, notify=not args.no_notify)
+    return monitor.run(dry_run=args.dry_run, notify=not args.no_notify,
+                       rolls_on=not args.no_rolls, roll_fee=args.roll_fee_per_leg,
+                       put_min_credit=args.put_min_credit)
+
+
+def _roll_fee(value):
+    from .rolls import parameters
+    try:
+        return parameters(fee=value)[0]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+
+
+def _put_credit(value):
+    from .rolls import parameters
+    try:
+        return parameters(put_min_credit=value)[1]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
 
 
 def cmd_positions(args) -> int:
@@ -346,13 +364,32 @@ def main(argv=None) -> int:
     ingest.add_argument("--no-quotes", action="store_true", help="skip refreshing quotes")
     ingest.set_defaults(func=cmd_ingest)
 
-    monitor = sub.add_parser("monitor",
-                             help="alert on positions that reached a price band")
+    monitor = sub.add_parser(
+        "monitor", help="price-band and defensive option-roll email alerts",
+        description="Monitor price bands and screen same-underlying short-put/long-call rolls. "
+                    "Replacements have later expiry, same/lower strike, unchanged quantity, "
+                    "at most 70 calendar DTE (New York date), and bid/ask spread <=50% of "
+                    "midpoint. No open-interest or last-trade requirement. Calls require "
+                    "no added cash; puts require net credit after estimated fees.",
+        epilog="Roll data requires LONGBRIDGE_APP_KEY, LONGBRIDGE_APP_SECRET, "
+               "LONGBRIDGE_ACCESS_TOKEN and OPRA US Options Quotes (OpenAPI) permission. "
+               "Shared local limit: 500 contract attempts per rolling minute and per pass; "
+               "metadata and depth each consume quota. At most four later expiries are "
+               "searched. Duplicate rolls are suppressed; different candidates have a "
+               "24-hour per-position cooldown. Indicative screens only; never places orders."
+    )
     monitor.add_argument("--dry-run", action="store_true",
-                         help="report what would be mailed, recording and sending nothing")
+                         help="preview without database writes or email; real API calls still "
+                              "consume quota and update local quota counters")
     monitor.add_argument("--no-notify", action="store_true",
-                         help="record the bands as reported without mailing them, which "
-                              "silences the positions already past a band")
+                         help="record bands and rolls as reported without email, silencing "
+                              "them and starting roll cooldowns")
+    monitor.add_argument("--no-rolls", action="store_true",
+                         help="price-band monitoring only; do not request Longbridge data")
+    monitor.add_argument("--roll-fee-per-leg", type=_roll_fee, default="0.65", metavar="USD",
+                         help="estimated fee per contract per leg (default: 0.65)")
+    monitor.add_argument("--put-min-credit", type=_put_credit, default="5.00", metavar="USD",
+                         help="positive minimum net put-roll credit per contract (default: 5)")
     monitor.set_defaults(func=cmd_monitor)
 
     positions = sub.add_parser("positions", help="current positions rolled forward from confirms")

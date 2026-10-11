@@ -132,13 +132,36 @@ def run(days: int = 7, reprocess: bool = False, dry_run: bool = False,
                 outcome["emails_stored"] += 1
                 outcome["trades_stored"] += len(trades)
                 outcome["net_amount"] += parsed.get("net_amount") or 0.0
-                outcome["trades"].extend(trades)
+                outcome["trades"].extend(dict(trade, body_sha256=digest) for trade in trades)
+
+            if outcome["trades"] and not dry_run and notify_on:
+                try:
+                    from ..positions import original_trade_context
+
+                    with conn.transaction():
+                        records = store.load_records(conn)
+                        history = store.load_trades(conn)
+                        email_index = store.trade_index(conn)
+                    if outcome["blocks_failed"]:
+                        email_index.append({"status": "partial", "confirm_date": None})
+                    contexts = original_trade_context(records, history, outcome["trades"], email_index)
+                    for trade, context in zip(outcome["trades"], contexts):
+                        trade["original_context"] = context
+                except Exception as exc:
+                    for trade in outcome["trades"]:
+                        trade["original_context"] = {
+                            "status": "unavailable", "original": None,
+                            "reason": "Original history could not be loaded",
+                        }
+                    outcome.setdefault("warnings", []).append(
+                        "Original trade context unavailable; current fills were stored.")
+                    log.warning("original trade context unavailable: %s", exc)
 
             if outcome["emails_stored"] and not dry_run and quotes:
                 try:
                     count, good, total, warnings = _refresh_quotes(conn)
-                    outcome.update(positions=count, quotes_ok=good, quotes_total=total,
-                                   warnings=warnings)
+                    outcome.update(positions=count, quotes_ok=good, quotes_total=total)
+                    outcome.setdefault("warnings", []).extend(warnings)
                 except Exception as exc:
                     # A quote failure must not lose the trades that were just stored.
                     outcome.setdefault("warnings", []).append(f"quote refresh failed: {exc}")

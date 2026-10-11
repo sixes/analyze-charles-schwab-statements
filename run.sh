@@ -13,6 +13,11 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+MONITOR_PYTHON=python3
+if [[ -x .venv/bin/python3 ]]; then
+    MONITOR_PYTHON="$PWD/.venv/bin/python3"
+fi
+
 PORT=9388
 PID_FILE=.run/app.pid
 LOG_FILE=.run/app.log
@@ -132,7 +137,7 @@ ingest() {
 monitor() {
     load_env
     mkdir -p "$(dirname "$MONITOR_LOCK")"
-    flock -n "$MONITOR_LOCK" python3 -u -m schwab monitor "$@" 2>&1 \
+    flock -n "$MONITOR_LOCK" "$MONITOR_PYTHON" -u -m schwab monitor "$@" 2>&1 \
         | awk '{ print strftime("%Y-%m-%d %H:%M:%S"), $0; fflush() }'
 }
 
@@ -159,7 +164,122 @@ cron_install() {
     echo "November the session is 22:30-05:00 local, so shift the hours by one."
 }
 
-case "${1:-start}" in
+usage() {
+    printf '%s\n' \
+        "Usage: $0 [command]" \
+        "       $0 {-h|--help|help [command]}" \
+        "       $0 <command> {-h|--help}" \
+        "" \
+        "Commands (default: start):" \
+        "  start         Start the password-protected web app on port $PORT." \
+        "  stop          Stop the web app and remove its PID file." \
+        "  restart       Stop, then start the web app." \
+        "  status        Check whether the web app is running." \
+        "  logs          Follow the web app log (last 100 lines first)." \
+        "  initdb        Create the application database and schema." \
+        "  inventory     Display stored data and reported alert bands." \
+        "  ingest        Fetch and store trade confirmations; may send email." \
+        "  monitor       Refresh position quotes and send new alerts." \
+        "  cron-install  Print suggested crontab entries; install nothing." \
+        "" \
+        "Use help <command> for usage, options and effects." \
+        "Help requires no credentials and does not load .env or change state."
+}
+
+usage_error() {
+    printf 'Error: %s\n' "$1" >&2
+    usage >&2
+    exit 2
+}
+
+command_help() {
+    local command="$1" effects
+    case "$command" in
+        start)
+            effects="Start the web app on 0.0.0.0:$PORT. Loads .env, secures credential files,
+creates a password if needed, and writes .run PID/log files. Firewall the port."
+            ;;
+        stop)
+            effects="Stop the web app (SIGTERM, then SIGKILL if needed) and remove its PID file."
+            ;;
+        restart)
+            effects="Stop, then start the web app. Loads .env, secures credential files,
+creates a password if needed, and updates .run PID/log files."
+            ;;
+        status)
+            effects="Check the PID file and process; change nothing. Exit 1 if not running."
+            ;;
+        logs)
+            effects="Show the last 100 web app log lines, then follow new lines until Ctrl-C.
+Reads .run/app.log; does not start the app."
+            ;;
+        initdb)
+            effects="Load .env (chmod 600) and create the application's database and schema."
+            ;;
+        inventory)
+            effects="Load .env (chmod 600) and read stored data and reported alert bands
+from the application database; does not start the app."
+            ;;
+        cron-install)
+            effects="Print suggested ingest/monitor crontab entries and scheduling notes.
+Does not install or modify cron, load .env, or start any job."
+            ;;
+        ingest|monitor)
+            printf 'Usage: %s %s [options]\n' "$0" "$command"
+            if [[ "$command" == ingest ]]; then
+                printf '%s\n' 'Fetch trade confirmations. Normal runs load .env (chmod 600), create' \
+                    '.run, acquire the ingest lock, write to the database, refresh quotes' \
+                    'and may send email. Help performs none of these actions.'
+            else
+                printf '%s\n' 'Monitor positions. Normal runs load .env (chmod 600), create .run,' \
+                    'acquire the monitor lock, fetch quotes, write to the database and' \
+                    'may send email. Help performs none of these actions.'
+            fi
+            if [[ "$command" == monitor ]]; then
+                "$MONITOR_PYTHON" -B -m schwab monitor --help
+            else
+                python3 -B -m schwab ingest --help
+            fi
+            return
+            ;;
+        *) usage_error "Unknown command: $command" ;;
+    esac
+    printf 'Usage: %s %s\n\n%s\n\nOptions: -h, --help (show help only). No other arguments accepted.\n' \
+        "$0" "$command" "$effects"
+}
+
+# Help must bypass credentials, locks, database and process-control side effects.
+command="${1-start}"
+case "$command" in
+    -h|--help)
+        [[ $# -eq 1 ]] || usage_error "Help accepts no extra arguments."
+        usage
+        exit 0
+        ;;
+    help)
+        [[ $# -le 2 ]] || usage_error "Use help [command]."
+        if [[ $# -eq 1 ]]; then usage; else command_help "$2"; fi
+        exit 0
+        ;;
+    start|stop|restart|status|logs|initdb|inventory|cron-install)
+        if [[ $# -eq 2 && ( "$2" == -h || "$2" == --help ) ]]; then
+            command_help "$command"
+            exit 0
+        fi
+        [[ $# -le 1 ]] || usage_error "$command accepts no arguments (except -h/--help)."
+        ;;
+    ingest|monitor)
+        for argument in "${@:2}"; do
+            if [[ "$argument" == -h || "$argument" == --help ]]; then
+                command_help "$command"
+                exit 0
+            fi
+        done
+        ;;
+    *) usage_error "Unknown command: $command" ;;
+esac
+
+case "$command" in
     start) start ;;
     stop) stop ;;
     restart) stop; start ;;
