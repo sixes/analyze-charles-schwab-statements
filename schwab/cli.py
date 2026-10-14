@@ -259,6 +259,12 @@ def cmd_monitor(args) -> int:
                        put_min_credit=args.put_min_credit)
 
 
+def cmd_news(args) -> int:
+    from . import news
+
+    return news.run(dry_run=args.dry_run, notify=not args.no_notify)
+
+
 def _roll_fee(value):
     from .rolls import parameters
     try:
@@ -391,6 +397,38 @@ def main(argv=None) -> int:
     monitor.add_argument("--put-min-credit", type=_put_credit, default="5.00", metavar="USD",
                          help="positive minimum net put-roll credit per contract (default: 5)")
     monitor.set_defaults(func=cmd_monitor)
+
+    from .news_qoder import DEADLINE as NEWS_DEADLINE
+
+    news = sub.add_parser(
+        "news", help="email a position-aware Sonus market briefing", allow_abbrev=False,
+        description="Research the last completed US trading session, its drivers and movers, "
+                    "next-session catalysts, and material position/watchlist updates with Sonus. "
+                    "Email GMAIL_TO without report copies. Only underlying tickers, long/short "
+                    "shares/call/put categories and watchlist symbols go to Qoder. Portfolio data stays read-only.",
+        epilog="Reuses the news profile's existing login unattended; requires verified web-only execution "
+               "inside bubblewrap. Qoder's home, diagnostics, plugin caches and temporary files stay "
+               "in RAM; only the existing authentication directory is writable on disk. "
+               "Sonus is the primary model; Qoder 1.1.66 WebFetch uses a secondary lite model. "
+               "Search any publisher; public-web fetches receive per-request approval without "
+               "a publisher allowlist. Non-public destinations and other tools are not approved. "
+               f"Research consumes Qoder usage/credits: {NEWS_DEADLINE / 60:g}-minute deadline, 6000 output "
+               "tokens per response, one model-request retry; these are not a monetary cap. "
+               "Stage messages and a 30-second research heartbeat show progress without report content. "
+               "Normal ./run and ./run.sh runs print to the terminal and append to private .run/news.log; "
+               "cron redirection to the same log does not duplicate lines. Help and dry-run previews "
+               "are not written to the log. Report content is never saved; only operational logs, "
+               "a lock and delivery date/timestamp are kept locally. Already SMTP-accepted "
+               "Shanghai dates are skipped. SMTP retries within a run reuse memory; retrying a "
+               "failed run requires fresh research. SMTP acceptance is not inbox delivery; "
+               "a crash can cause duplicate email."
+    )
+    news.add_argument("--dry-run", action="store_true",
+                      help="print sanitized prompt after a read-only position snapshot; no "
+                           "model, report files, lock or email (launcher still loads/chmods .env)")
+    news.add_argument("--no-notify", action="store_true",
+                      help="research and validate, then discard without saving or emailing; consumes credits")
+    news.set_defaults(func=cmd_news)
 
     positions = sub.add_parser("positions", help="current positions rolled forward from confirms")
     positions.add_argument("--no-quotes", action="store_true", help="omit market marks")

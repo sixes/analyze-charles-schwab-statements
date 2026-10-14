@@ -11,9 +11,9 @@ import unittest
 LAUNCHER = Path(__file__).resolve().parents[1] / "run.sh"
 COMMANDS = (
     "start", "stop", "restart", "status", "logs", "initdb", "inventory",
-    "ingest", "monitor", "cron-install",
+    "ingest", "monitor", "news", "cron-install",
 )
-ARGUMENT_FREE = tuple(c for c in COMMANDS if c not in ("ingest", "monitor"))
+ARGUMENT_FREE = tuple(c for c in COMMANDS if c not in ("ingest", "monitor", "news"))
 BASH = shutil.which("bash")
 
 
@@ -26,6 +26,8 @@ class RunHelpTests(unittest.TestCase):
         self.project.mkdir()
         self.launcher = self.project / "run.sh"
         shutil.copy2(LAUNCHER, self.launcher)
+        self.wrapper = self.project / "run"
+        shutil.copy2(LAUNCHER.with_name("run"), self.wrapper)
         self.bin = self.root / "bin"
         self.bin.mkdir()
         self.env_file = self.project / ".env"
@@ -49,6 +51,7 @@ class RunHelpTests(unittest.TestCase):
             "LC_ALL": "C",
         }
         os.symlink(shutil.which("dirname"), self.bin / "dirname")
+        os.symlink(BASH, self.bin / "bash")
         # Unknown programs cannot run: PATH contains only these failing stubs,
         # dirname, and the strict help-only Python stand-in.
         for name in (
@@ -63,7 +66,7 @@ class RunHelpTests(unittest.TestCase):
         self.write_executable(
             self.bin / "python3",
             'if [[ $# -ne 5 || "$1" != -B || "$2" != -m || "$3" != schwab\n'
-            '      || ( "$4" != ingest && "$4" != monitor ) || "$5" != --help ]]; then\n'
+            '      || ( "$4" != ingest && "$4" != monitor && "$4" != news ) || "$5" != --help ]]; then\n'
             '    printf "FORBIDDEN python invocation\\n"\n'
             '    exit 98\n'
             'fi\n'
@@ -146,7 +149,7 @@ class RunHelpTests(unittest.TestCase):
                 with self.subTest(args=args):
                     result = self.assert_safe(args)
                     self.assertIn(f"run.sh {command}", result.stdout)
-                    if command in ("ingest", "monitor"):
+                    if command in ("ingest", "monitor", "news"):
                         self.assertEqual(result.stdout.count("ARGPARSE"), 1)
                         self.assertIn(f"ARGPARSE {command} --help", result.stdout)
                         self.assertIn("--dry-run --no-notify", result.stdout)
@@ -161,11 +164,17 @@ class RunHelpTests(unittest.TestCase):
         self.seed_runtime()
         self.check_help_forms()
 
+    def test_forwarding_wrapper_preserves_help_safety(self):
+        self.seed_runtime()
+        self.launcher = self.wrapper
+        self.check_help_forms()
+
     def test_delegated_help_after_or_before_options_is_safe(self):
         self.seed_runtime()
         for command, options in (
             ("ingest", ("--days", "7", "--dry-run", "--no-notify")),
             ("monitor", ("--dry-run", "--no-notify")),
+            ("news", ("--dry-run", "--no-notify")),
         ):
             for flag in ("-h", "--help"):
                 for args in ((command, flag, *options), (command, *options, flag)):
@@ -210,13 +219,70 @@ class RunHelpTests(unittest.TestCase):
 
     def test_delegated_help_failure_is_propagated_without_side_effects(self):
         self.write_executable(self.bin / "python3", 'exit 37\n')
-        for command in ("ingest", "monitor"):
+        for command in ("ingest", "monitor", "news"):
             for args in (("help", command), (command, "-h"), (command, "--help")):
                 with self.subTest(args=args):
                     before = self.snapshot()
                     result = self.invoke(args)
                     self.assertEqual(result.returncode, 37, result)
                     self.assertEqual(self.snapshot(), before)
+
+
+class NewsLoggingTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="news-launcher-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        for name in ("run", "run.sh"):
+            shutil.copy2(LAUNCHER.with_name(name), self.root / name)
+        binary = self.root / ".venv" / "bin"
+        binary.mkdir(parents=True)
+        python = binary / "python3"
+        python.write_text(
+            f"#!{BASH}\n"
+            'for argument in "$@"; do\n'
+            '  case "$argument" in\n'
+            '    --help) printf "news help\\n"; exit 0 ;;\n'
+            '    --dry-run) printf "PRIVATE-PROMPT\\n"; exit 0 ;;\n'
+            '    --failure) printf "News failed: synthetic failure\\n" >&2; exit 7 ;;\n'
+            '  esac\n'
+            'done\n'
+            'printf "News: synthetic progress\\n"\n'
+        )
+        python.chmod(0o700)
+        self.log = self.root / ".run" / "news.log"
+
+    def invoke(self, *args, wrapper="run", **kwargs):
+        return subprocess.run(
+            [str(self.root / wrapper), "news", *args], cwd=self.root,
+            env={"PATH": os.defpath, "LANG": "C"}, text=True, timeout=10, **kwargs)
+
+    def test_terminal_and_failure_logs_preserve_exit_status(self):
+        for wrapper in ("run", "run.sh"):
+            for args, expected in (((), 0), (("--failure",), 7)):
+                before = self.log.read_text() if self.log.exists() else ""
+                result = self.invoke(*args, wrapper=wrapper, capture_output=True)
+                self.assertEqual(result.returncode, expected)
+                self.assertEqual(self.log.read_text(), before + result.stdout)
+                self.assertEqual(self.log.stat().st_mode & 0o777, 0o600)
+
+    def test_cron_redirection_does_not_duplicate_lines(self):
+        self.log.parent.mkdir(mode=0o700)
+        with self.log.open("a") as output:
+            result = self.invoke(stdout=output, stderr=subprocess.STDOUT)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(self.log.read_text().count("synthetic progress"), 1)
+
+    def test_previews_never_create_or_append_logs(self):
+        for flag in ("--dry-run", "--help"):
+            result = self.invoke(flag, capture_output=True)
+            self.assertEqual(result.returncode, 0)
+            self.assertFalse(self.log.parent.exists())
+        self.invoke(capture_output=True)
+        before = self.log.read_bytes()
+        for flag in ("--dry-run", "--help"):
+            self.invoke(flag, capture_output=True)
+            self.assertEqual(self.log.read_bytes(), before)
 
 
 if __name__ == "__main__":

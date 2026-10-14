@@ -141,6 +141,34 @@ monitor() {
         | awk '{ print strftime("%Y-%m-%d %H:%M:%S"), $0; fflush() }'
 }
 
+news() {
+    local argument log=.run/news.log
+    for argument in "$@"; do
+        if [[ "$argument" == --dry-run ]]; then
+            load_env
+            "$MONITOR_PYTHON" -B -u -m schwab news "$@" 2>&1 \
+                | awk '{ print strftime("%Y-%m-%d %H:%M:%S"), $0; fflush() }'
+            return
+        fi
+    done
+    umask 077
+    if [[ -L .run || ( -e .run && ! -d .run ) || -L "$log" || ( -e "$log" && ! -f "$log" ) ]]; then
+        printf '%s\n' 'News failed: runtime directory and log must not be symlinks or special files.' >&2
+        return 1
+    fi
+    mkdir -p .run
+    : >> "$log"
+    chmod 600 "$log"
+    # Cron already redirects stdout here; do not append the same lines twice.
+    if [[ /dev/fd/1 -ef "$log" ]]; then log=; fi
+    { load_env; "$MONITOR_PYTHON" -B -u -m schwab news "$@"; } 2>&1 \
+        | awk -v log_path="$log" '{
+            line = strftime("%Y-%m-%d %H:%M:%S") " " $0
+            if (log_path != "") { print line >> log_path; fflush(log_path) }
+            print line; fflush()
+        }'
+}
+
 cron_install() {
     echo "Add these lines with 'crontab -e' (not installed automatically):"
     echo
@@ -162,6 +190,15 @@ cron_install() {
     echo
     echo "The window is written for daylight saving time. When New York moves to EST in"
     echo "November the session is 22:30-05:00 local, so shift the hours by one."
+    echo
+    echo "# Daily Sonus news, including weekends; requires verified news-profile login."
+    echo "# Scheduler timezone must be Asia/Shanghai (not merely command-level TZ)."
+    echo "# If using CRON_TZ, restore its previous scope before other jobs."
+    echo "# schwab-news-daily"
+    printf '0 20 * * * umask 077; "%s/run" news >> "%s/.run/news.log" 2>&1\n' "$PWD" "$PWD"
+    echo "News emails only; it keeps a lock and delivery timestamp, not report copies."
+    echo "Existing news-profile login is reused unattended; research consumes Qoder usage/credits."
+    echo "No monetary cap. Activate only after isolated Sonus/web-only runtime verification."
 }
 
 usage() {
@@ -180,6 +217,7 @@ usage() {
         "  inventory     Display stored data and reported alert bands." \
         "  ingest        Fetch and store trade confirmations; may send email." \
         "  monitor       Refresh position quotes and send new alerts." \
+        "  news          Email a daily Sonus briefing without saving report copies." \
         "  cron-install  Print suggested crontab entries; install nothing." \
         "" \
         "Use help <command> for usage, options and effects." \
@@ -221,22 +259,26 @@ Reads .run/app.log; does not start the app."
 from the application database; does not start the app."
             ;;
         cron-install)
-            effects="Print suggested ingest/monitor crontab entries and scheduling notes.
+            effects="Print suggested ingest/monitor/news crontab entries and scheduling notes.
 Does not install or modify cron, load .env, or start any job."
             ;;
-        ingest|monitor)
+        ingest|monitor|news)
             printf 'Usage: %s %s [options]\n' "$0" "$command"
             if [[ "$command" == ingest ]]; then
                 printf '%s\n' 'Fetch trade confirmations. Normal runs load .env (chmod 600), create' \
                     '.run, acquire the ingest lock, write to the database, refresh quotes' \
                     'and may send email. Help performs none of these actions.'
+            elif [[ "$command" == news ]]; then
+                printf '%s\n' 'News runs load .env (chmod 600), read positions, and use paid Sonus web' \
+                    'research with underlying tickers, position categories and watchlist symbols.' \
+                    'Briefings are emailed to GMAIL_TO without report copies. Help does none of this.'
             else
                 printf '%s\n' 'Monitor positions. Normal runs load .env (chmod 600), create .run,' \
                     'acquire the monitor lock, fetch quotes, write to the database and' \
                     'may send email. Help performs none of these actions.'
             fi
-            if [[ "$command" == monitor ]]; then
-                "$MONITOR_PYTHON" -B -m schwab monitor --help
+            if [[ "$command" == monitor || "$command" == news ]]; then
+                "$MONITOR_PYTHON" -B -m schwab "$command" --help
             else
                 python3 -B -m schwab ingest --help
             fi
@@ -268,7 +310,7 @@ case "$command" in
         fi
         [[ $# -le 1 ]] || usage_error "$command accepts no arguments (except -h/--help)."
         ;;
-    ingest|monitor)
+    ingest|monitor|news)
         for argument in "${@:2}"; do
             if [[ "$argument" == -h || "$argument" == --help ]]; then
                 command_help "$command"
@@ -289,9 +331,10 @@ case "$command" in
     inventory) inventory ;;
     ingest) shift; ingest "$@" ;;
     monitor) shift; monitor "$@" ;;
+    news) shift; news "$@" ;;
     cron-install) cron_install ;;
     *)
-        echo "Usage: $0 {start|stop|restart|status|logs|initdb|inventory|ingest|monitor|cron-install}" >&2
+        echo "Usage: $0 {start|stop|restart|status|logs|initdb|inventory|ingest|monitor|news|cron-install}" >&2
         exit 2
         ;;
 esac
