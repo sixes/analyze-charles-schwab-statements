@@ -338,8 +338,7 @@ def validate_report(report, evidence, as_of, context):
         for key in ("catalyst", "watch_trigger", "risk", "invalidation"):
             text(idea[key])
         citations(idea["sources"], f"opportunities[{index}].sources")
-    fail_if(used != source_ids, "Unreferenced sources in briefing.")
-    return report
+    return {**report, "sources": [source for source in report["sources"] if source["id"] in used]}
 
 
 def render(report, context, warnings):
@@ -485,7 +484,11 @@ def run(*, dry_run=False, notify=True):
                   f"{news_qoder.DEADLINE / 60:g} minutes.", flush=True)
             report, evidence = news_qoder.research(SYSTEM_PROMPT, prompt_for(context, now))
             print(f"News {day}: research returned; validating briefing and sources.", flush=True)
-            validate_report(report, evidence, now.isoformat(), context)
+            validated = validate_report(report, evidence, now.isoformat(), context)
+            unused = len(report["sources"]) - len(validated["sources"])
+            report = validated
+            if unused:
+                print(f"News {day}: removed {unused} unused bibliography entries; continuing.", flush=True)
             fail_if(utc_now().astimezone(SHANGHAI).date().isoformat() != day,
                     "Research crossed the Shanghai date boundary; no email was sent.")
             subject, plain, html = render(report, context, warnings)

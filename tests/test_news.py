@@ -283,7 +283,7 @@ class ValidationAndRenderingTests(IsolatedNewsCase):
                 report = briefing(context)
                 report["opportunities"] = []
                 report["opportunity_note"] = "No compelling opportunity on the observed evidence."
-                self.assertIs(news.validate_report(report, [URL], NOW.isoformat(), context), report)
+                self.assertEqual(news.validate_report(report, [URL], NOW.isoformat(), context), report)
                 subject, plain, html = news.render(report, context, [])
                 self.assertIn("2026-10-10", subject)
                 for value in (report["summary"], report["opportunity_note"], news.DISCLAIMER):
@@ -353,7 +353,7 @@ class ValidationAndRenderingTests(IsolatedNewsCase):
         self.assertEqual(news.public_url(URL), URL)
         self.assertEqual(news.public_url("http://www.sec.gov/news"), "http://www.sec.gov/news")
 
-    def test_missing_unsupported_and_unused_citations_fail_closed(self):
+    def test_missing_unsupported_and_invalid_citations_fail_closed(self):
         for key in ("market", "holdings", "counter_thesis", "catalysts", "opportunities"):
             for refs in ([], ["s99"], [None], "s1"):
                 with self.subTest(key=key, refs=refs):
@@ -364,10 +364,34 @@ class ValidationAndRenderingTests(IsolatedNewsCase):
         for evidence in ([], [FETCH_URL]):
             with self.subTest(evidence=evidence), self.assertRaises(news.NewsError):
                 news.validate_report(briefing(), evidence, NOW.isoformat(), CONTEXT)
-        for sid in ("s1", "s2", "s0", "unknown"):
+        for sid in ("s1", "s0", "unknown"):
             report = briefing()
             report["sources"].append(dict(report["sources"][0], id=sid))
             with self.subTest(extra_source=sid), self.assertRaises(news.NewsError):
+                news.validate_report(report, [URL], NOW.isoformat(), CONTEXT)
+
+    def test_unused_sources_are_pruned_without_changing_claims_or_source_order(self):
+        report = briefing()
+        source = report["sources"][0]
+        report["sources"] = [dict(source, id=sid) for sid in ("s4", "s3", "s2", "s1")]
+        report["opportunities"][0]["sources"] = ["s3"]
+        original = copy.deepcopy(report)
+        validated = news.validate_report(report, [URL], NOW.isoformat(), CONTEXT)
+        self.assertIsNot(validated, report)
+        self.assertEqual(report, original)
+        self.assertEqual([source["id"] for source in validated["sources"]], ["s3", "s1"])
+        expected = copy.deepcopy(original)
+        expected["sources"] = [original["sources"][1], original["sources"][3]]
+        self.assertEqual(validated, expected)
+
+    def test_invalid_unused_sources_still_fail_closed(self):
+        variants = ({"url": "http://127.0.0.1/private"}, {"url": FETCH_URL},
+                    {"published_date": "2026-99-99"}, {"published_date": "2099-01-01"},
+                    {"background": "false"}, {"title": ""}, {"unexpected": True})
+        for changes in variants:
+            report = briefing()
+            report["sources"].append(dict(report["sources"][0], id="s2", **changes))
+            with self.subTest(changes=changes), self.assertRaises(news.NewsError):
                 news.validate_report(report, [URL], NOW.isoformat(), CONTEXT)
 
     def test_wrong_schema_timestamps_empty_sections_and_false_holding_relevance(self):
@@ -401,7 +425,7 @@ class ValidationAndRenderingTests(IsolatedNewsCase):
     def test_large_search_evidence_does_not_limit_valid_briefing(self):
         evidence = [URL] + [f"{URL}&result={i}" for i in range(500)]
         report = briefing()
-        self.assertIs(news.validate_report(report, evidence, NOW.isoformat(), CONTEXT), report)
+        self.assertEqual(news.validate_report(report, evidence, NOW.isoformat(), CONTEXT), report)
 
     def test_list_errors_identify_field_and_count_without_content(self):
         for key in ("market", "holdings", "counter_thesis", "catalysts", "opportunities", "sources"):
